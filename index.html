@@ -104,6 +104,10 @@
 </div>
 
 <div class="card">
+  <div style="margin-bottom:14px;">
+    <div class="meterLabels" style="margin:0 0 4px;"><span>Mic boost</span><span id="gainLabel">10×</span></div>
+    <input id="gainSlider" type="range" min="1" max="40" step="1" value="10" style="width:100%;">
+  </div>
   <button id="toggleBtn">Start</button>
   <div id="status">Tip: use headphones later when playing backing tracks.</div>
 </div>
@@ -115,8 +119,8 @@
 const FFT_SIZE        = 2048;   // audio window size. Bigger = more accurate for low notes, but slower.
 const MIN_FREQ        = 70;     // lowest note we look for (Hz). ~C#2
 const MAX_FREQ        = 1200;   // highest note we look for (Hz). ~D6
-const YIN_THRESHOLD   = 0.15;   // lower = stricter (fewer false notes), higher = more sensitive
-const VOLUME_GATE     = 0.003;  // ignore sounds quieter than this (stops background noise showing notes)
+const YIN_THRESHOLD   = 0.2;    // lower = stricter (fewer false notes), higher = more sensitive
+const VOLUME_GATE     = 0.01;   // ignore sounds quieter than this AFTER the boost (stops background noise showing notes)
 const HISTORY_SECONDS = 5;      // how much history the graph shows
 const IN_TUNE_CENTS   = 15;     // within this many cents = green
 
@@ -131,6 +135,8 @@ const centsEl  = document.getElementById('centsText');
 const needleEl = document.getElementById('needle');
 const statusEl = document.getElementById('status');
 const btn      = document.getElementById('toggleBtn');
+const gainSlider = document.getElementById('gainSlider');
+const gainLabel  = document.getElementById('gainLabel');
 const canvas   = document.getElementById('history');
 const ctx2d    = canvas.getContext('2d');
 
@@ -228,6 +234,7 @@ function smoothMidi(midi) {
    6. MICROPHONE + MAIN LOOP
    ===================================================== */
 let audioCtx = null;
+let gainNode = null;
 let analyser = null;
 let stream = null;
 let running = false;
@@ -255,9 +262,15 @@ async function start() {
   // Mobile browsers often start audio "suspended" – this wakes it up
   await audioCtx.resume();
   const source = audioCtx.createMediaStreamSource(stream);
+
+  // Software volume boost: the phone mic is quiet with its auto-gain turned off
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = Number(gainSlider.value);
+
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = FFT_SIZE;
-  source.connect(analyser);
+  source.connect(gainNode);
+  gainNode.connect(analyser);
   timeBuffer = new Float32Array(analyser.fftSize);
 
   running = true;
@@ -383,6 +396,12 @@ function drawHistory(now) {
    8. BUTTON
    ===================================================== */
 btn.addEventListener('click', () => { running ? stop() : start(); });
+
+// Mic boost slider – works live while singing
+gainSlider.addEventListener('input', () => {
+  gainLabel.textContent = gainSlider.value + '×';
+  if (gainNode) gainNode.gain.value = Number(gainSlider.value);
+});
 </script>
 </body>
 </html>
