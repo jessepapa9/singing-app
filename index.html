@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sing Practice</title>
+<style>
+  /* ---------- LOOK & FEEL (edit these freely) ---------- */
+  :root {
+    --bg: #12141c;
+    --card: #1c2030;
+    --text: #f2f4fa;
+    --muted: #8a92ab;
+    --good: #3ddc97;
+    --ok: #ffc857;
+    --bad: #ff5d73;
+    --accent: #6c8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+    min-height: 100vh;
+  }
+  h1 { font-size: 1.1rem; font-weight: 600; color: var(--muted); margin: 8px 0 16px; }
+  .card {
+    background: var(--card);
+    border-radius: 16px;
+    padding: 20px;
+    width: 100%;
+    max-width: 460px;
+    margin-bottom: 16px;
+    text-align: center;
+  }
+  #note { font-size: 6rem; font-weight: 700; line-height: 1; min-height: 6rem; }
+  #freq { color: var(--muted); margin-top: 8px; font-variant-numeric: tabular-nums; }
+  #centsText { font-size: 1.3rem; margin-top: 6px; font-variant-numeric: tabular-nums; min-height: 1.6rem; }
+
+  /* The tuning meter: centre line = perfectly in tune */
+  #meter {
+    position: relative;
+    height: 36px;
+    margin-top: 18px;
+    background: #272c42;
+    border-radius: 18px;
+    overflow: hidden;
+  }
+  #meter .centre {
+    position: absolute; left: 50%; top: 0; bottom: 0;
+    width: 2px; background: var(--muted);
+  }
+  #needle {
+    position: absolute; top: 4px; bottom: 4px; left: 50%;
+    width: 8px; margin-left: -4px;
+    border-radius: 4px;
+    background: var(--muted);
+    transition: left 0.05s linear;
+  }
+  .meterLabels { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.75rem; margin-top: 4px; }
+
+  canvas { width: 100%; height: 160px; background: #10131d; border-radius: 12px; display: block; }
+
+  button {
+    background: var(--accent); color: white; border: 0;
+    font-size: 1.1rem; font-weight: 600;
+    padding: 14px 28px; border-radius: 12px; width: 100%;
+  }
+  button.stop { background: var(--bad); }
+  #status { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<h1>🎤 Sing Practice – v1: Pitch Detector</h1>
+
+<div class="card">
+  <div id="note">–</div>
+  <div id="freq">Press Start and sing a note</div>
+  <div id="centsText"></div>
+
+  <div id="meter">
+    <div class="centre"></div>
+    <div id="needle"></div>
+  </div>
+  <div class="meterLabels"><span>♭ flat</span><span>in tune</span><span>sharp ♯</span></div>
+</div>
+
+<div class="card">
+  <canvas id="history"></canvas>
+  <div class="meterLabels"><span>5 seconds ago</span><span>now</span></div>
+</div>
+
+<div class="card">
+  <button id="toggleBtn">Start</button>
+  <div id="status">Tip: use headphones later when playing backing tracks.</div>
+</div>
+
+<script>
+/* =====================================================
+   1. SETTINGS (safe to tweak)
+   ===================================================== */
+const FFT_SIZE        = 2048;   // audio window size. Bigger = more accurate for low notes, but slower.
+const MIN_FREQ        = 70;     // lowest note we look for (Hz). ~C#2
+const MAX_FREQ        = 1200;   // highest note we look for (Hz). ~D6
+const YIN_THRESHOLD   = 0.15;   // lower = stricter (fewer false notes), higher = more sensitive
+const VOLUME_GATE     = 0.01;   // ignore sounds quieter than this (stops background noise showing notes)
+const HISTORY_SECONDS = 5;      // how much history the graph shows
+const IN_TUNE_CENTS   = 15;     // within this many cents = green
+
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+/* =====================================================
+   2. PAGE ELEMENTS
+   ===================================================== */
+const noteEl   = document.getElementById('note');
+const freqEl   = document.getElementById('freq');
+const centsEl  = document.getElementById('centsText');
+const needleEl = document.getElementById('needle');
+const statusEl = document.getElementById('status');
+const btn      = document.getElementById('toggleBtn');
+const canvas   = document.getElementById('history');
+const ctx2d    = canvas.getContext('2d');
+
+/* =====================================================
+   3. MUSIC MATHS
+   ===================================================== */
+// Frequency (Hz) -> MIDI note number as a decimal. A4 = 440Hz = MIDI 69.
+function freqToMidi(freq) {
+  return 69 + 12 * Math.log2(freq / 440);
+}
+// MIDI number -> name like "B3"
+function midiToName(midi) {
+  const n = Math.round(midi);
+  const name = NOTE_NAMES[((n % 12) + 12) % 12];
+  const octave = Math.floor(n / 12) - 1;   // MIDI 60 = C4
+  return name + octave;
+}
+
+/* =====================================================
+   4. PITCH DETECTION (YIN algorithm)
+   Finds the repeating period of the sound wave.
+   Frequency = sampleRate / period.
+   ===================================================== */
+function detectPitch(buffer, sampleRate) {
+  // Volume check (RMS = average loudness)
+  let sumSquares = 0;
+  for (let i = 0; i < buffer.length; i++) sumSquares += buffer[i] * buffer[i];
+  const rms = Math.sqrt(sumSquares / buffer.length);
+  if (rms < VOLUME_GATE) return -1;
+
+  const windowSize = Math.floor(buffer.length / 2);
+  const minTau = Math.floor(sampleRate / MAX_FREQ);
+  const maxTau = Math.min(windowSize - 1, Math.floor(sampleRate / MIN_FREQ));
+
+  // Step 1: difference function – how different is the wave from a shifted copy of itself?
+  const diff = new Float32Array(maxTau + 1);
+  for (let tau = 1; tau <= maxTau; tau++) {
+    let sum = 0;
+    for (let i = 0; i < windowSize; i++) {
+      const delta = buffer[i] - buffer[i + tau];
+      sum += delta * delta;
+    }
+    diff[tau] = sum;
+  }
+
+  // Step 2: normalise it (cumulative mean) so that thresholds work at any volume
+  const cmnd = new Float32Array(maxTau + 1);
+  cmnd[0] = 1;
+  let runningSum = 0;
+  for (let tau = 1; tau <= maxTau; tau++) {
+    runningSum += diff[tau];
+    cmnd[tau] = diff[tau] * tau / runningSum;
+  }
+
+  // Step 3: find the first dip below the threshold
+  let tauEstimate = -1;
+  for (let tau = minTau; tau <= maxTau; tau++) {
+    if (cmnd[tau] < YIN_THRESHOLD) {
+      // walk to the bottom of this dip
+      while (tau + 1 <= maxTau && cmnd[tau + 1] < cmnd[tau]) tau++;
+      tauEstimate = tau;
+      break;
+    }
+  }
+  if (tauEstimate === -1) return -1;   // no clear pitch (e.g. breathy / noisy)
+
+  // Step 4: refine between samples (parabolic interpolation) for better accuracy
+  const x0 = tauEstimate > 1 ? tauEstimate - 1 : tauEstimate;
+  const x2 = tauEstimate + 1 <= maxTau ? tauEstimate + 1 : tauEstimate;
+  let betterTau = tauEstimate;
+  if (x0 !== tauEstimate && x2 !== tauEstimate) {
+    const s0 = cmnd[x0], s1 = cmnd[tauEstimate], s2 = cmnd[x2];
+    const denom = 2 * (2 * s1 - s2 - s0);
+    if (denom !== 0) betterTau = tauEstimate + (s2 - s0) / denom;
+  }
+
+  return sampleRate / betterTau;
+}
+
+/* =====================================================
+   5. SMOOTHING
+   Take the median of the last few readings to ignore one-frame glitches.
+   ===================================================== */
+const recentMidi = [];
+function smoothMidi(midi) {
+  recentMidi.push(midi);
+  if (recentMidi.length > 5) recentMidi.shift();
+  const sorted = [...recentMidi].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+/* =====================================================
+   6. MICROPHONE + MAIN LOOP
+   ===================================================== */
+let audioCtx = null;
+let analyser = null;
+let stream = null;
+let running = false;
+let rafId = null;
+let timeBuffer = null;
+let lastFrameTime = 0;
+const history = [];   // { t: time in ms, midi: number or null }
+
+async function start() {
+  try {
+    // Turn OFF the phone's voice processing – it distorts pitch.
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+  } catch (err) {
+    statusEl.textContent = 'Microphone blocked or unavailable: ' + err.message;
+    return;
+  }
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = FFT_SIZE;
+  source.connect(analyser);
+  timeBuffer = new Float32Array(analyser.fftSize);
+
+  running = true;
+  btn.textContent = 'Stop';
+  btn.classList.add('stop');
+  statusEl.textContent = 'Listening… sing a sustained "ah".';
+  loop();
+}
+
+function stop() {
+  running = false;
+  cancelAnimationFrame(rafId);
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+  btn.textContent = 'Start';
+  btn.classList.remove('stop');
+  statusEl.textContent = 'Stopped.';
+  showNothing();
+}
+
+function loop() {
+  if (!running) return;
+
+  analyser.getFloatTimeDomainData(timeBuffer);
+  const freq = detectPitch(timeBuffer, audioCtx.sampleRate);
+
+  const now = performance.now();
+  if (freq > 0) {
+    const midi = smoothMidi(freqToMidi(freq));
+    showPitch(freq, midi);
+    history.push({ t: now, midi: midi });
+  } else {
+    recentMidi.length = 0;
+    showNothing();
+    history.push({ t: now, midi: null });
+  }
+
+  // drop history older than the window
+  const cutoff = now - HISTORY_SECONDS * 1000;
+  while (history.length && history[0].t < cutoff) history.shift();
+
+  drawHistory(now);
+  rafId = requestAnimationFrame(loop);
+}
+
+/* =====================================================
+   7. DISPLAY
+   ===================================================== */
+function showPitch(freq, midi) {
+  const nearest = Math.round(midi);
+  const cents = (midi - nearest) * 100;           // -50 to +50
+  const absCents = Math.abs(cents);
+
+  noteEl.textContent = midiToName(midi);
+  freqEl.textContent = freq.toFixed(1) + ' Hz';
+  centsEl.textContent = (cents >= 0 ? '+' : '') + cents.toFixed(0) + ' cents';
+
+  const colour = absCents <= IN_TUNE_CENTS ? 'var(--good)'
+               : absCents <= 30            ? 'var(--ok)'
+               :                             'var(--bad)';
+  noteEl.style.color = colour;
+  needleEl.style.background = colour;
+  needleEl.style.left = (50 + cents) + '%';       // -50..+50 cents -> 0..100%
+}
+
+function showNothing() {
+  noteEl.textContent = '–';
+  noteEl.style.color = 'var(--muted)';
+  freqEl.textContent = running ? 'Listening…' : 'Press Start and sing a note';
+  centsEl.textContent = '';
+  needleEl.style.left = '50%';
+  needleEl.style.background = 'var(--muted)';
+}
+
+// Scrolling graph of your pitch over the last few seconds.
+// This is the seed of the SingStar-style display we'll build later.
+function drawHistory(now) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx2d.clearRect(0, 0, w, h);
+
+  // Vertical range: roughly E2 (40) to C6 (84) – adjust to suit your voice
+  const lowMidi = 40, highMidi = 84;
+  const yFor = m => h - ((m - lowMidi) / (highMidi - lowMidi)) * h;
+
+  // Horizontal gridlines at each C
+  ctx2d.strokeStyle = '#2a3048';
+  ctx2d.fillStyle = '#5b6482';
+  ctx2d.font = '11px system-ui';
+  ctx2d.lineWidth = 1;
+  for (let m = lowMidi; m <= highMidi; m++) {
+    if (m % 12 === 0) {
+      const y = yFor(m);
+      ctx2d.beginPath(); ctx2d.moveTo(0, y); ctx2d.lineTo(w, y); ctx2d.stroke();
+      ctx2d.fillText(midiToName(m), 4, y - 3);
+    }
+  }
+
+  // Your pitch as a line
+  ctx2d.strokeStyle = '#6c8cff';
+  ctx2d.lineWidth = 3;
+  ctx2d.lineCap = 'round';
+  ctx2d.beginPath();
+  let penDown = false;
+  for (const p of history) {
+    if (p.midi === null) { penDown = false; continue; }
+    const x = w - ((now - p.t) / (HISTORY_SECONDS * 1000)) * w;
+    const y = yFor(p.midi);
+    if (!penDown) { ctx2d.moveTo(x, y); penDown = true; }
+    else ctx2d.lineTo(x, y);
+  }
+  ctx2d.stroke();
+}
+
+/* =====================================================
+   8. BUTTON
+   ===================================================== */
+btn.addEventListener('click', () => { running ? stop() : start(); });
+</script>
+</body>
+</html>
