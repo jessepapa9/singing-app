@@ -109,7 +109,10 @@ const CLOSE_CENTS       = 35;     // within this many cents = yellow, beyond = r
 const DISPLAY_SMOOTHING = 0.12;   // how much the big note/cents readout smooths out wobble.
                                   // smaller = steadier but slower to react (try 0.05 – 0.3)
 
-const HISTORY_SECONDS   = 6;      // how much history the graph shows
+const VISIBLE_SECONDS   = 8;      // total seconds of time shown across the graph (past + future)
+const NOW_POSITION      = 0.35;   // where the "now" line sits, as a fraction of the graph width from the left.
+                                  // 0.35 = 35% in. Your pitch is drawn to the left of it;
+                                  // the space to the right is reserved for upcoming target notes.
 const VIEW_SEMITONES    = 24;     // how many note lanes the graph shows at once (24 = 2 octaves)
 const LABEL_WIDTH       = 46;     // width of the note-name column on the left of the graph (px)
 
@@ -318,7 +321,7 @@ function loop() {
   }
 
   // drop history older than the window
-  const cutoff = now - HISTORY_SECONDS * 1000;
+  const cutoff = now - VISIBLE_SECONDS * NOW_POSITION * 1000;
   while (history.length && history[0].t < cutoff) history.shift();
 
   drawGraph(now);
@@ -384,6 +387,10 @@ function drawGraph(now) {
   const plotWidth = w - plotLeft;
   const activeNote = displayMidi === null ? null : Math.round(displayMidi);
 
+  // Time -> horizontal position. "now" sits partway across; the past scrolls off to the left.
+  const nowX = plotLeft + plotWidth * NOW_POSITION;
+  const pxPerSec = plotWidth / VISIBLE_SECONDS;
+
   // --- note lanes: each note owns a band centred on its exact pitch ---
   ctx2d.textBaseline = 'middle';
   for (let n = Math.floor(lowMidi) - 1; n <= Math.ceil(highMidi) + 1; n++) {
@@ -419,6 +426,14 @@ function drawGraph(now) {
     ctx2d.fillText(midiToName(n), plotLeft - 8, yMid);
   }
 
+  // --- the "now" line: target notes will scroll in from the right and reach this line ---
+  ctx2d.strokeStyle = 'rgba(242,244,250,0.55)';
+  ctx2d.lineWidth = 2;
+  ctx2d.beginPath();
+  ctx2d.moveTo(nowX, 0);
+  ctx2d.lineTo(nowX, h);
+  ctx2d.stroke();
+
   // --- your pitch as a line ---
   ctx2d.strokeStyle = COLOURS.line;
   ctx2d.lineWidth = 3;
@@ -429,7 +444,7 @@ function drawGraph(now) {
   let lastX = 0, lastY = 0, lastPoint = null;
   for (const p of history) {
     if (p.midi === null) { penDown = false; continue; }
-    const x = plotLeft + (1 - (now - p.t) / (HISTORY_SECONDS * 1000)) * plotWidth;
+    const x = nowX - ((now - p.t) / 1000) * pxPerSec;
     const y = yFor(p.midi);
     if (!penDown) { ctx2d.moveTo(x, y); penDown = true; }
     else ctx2d.lineTo(x, y);
