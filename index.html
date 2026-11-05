@@ -64,6 +64,9 @@
   }
   .meterLabels { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.75rem; margin-top: 4px; }
 
+  #levelWrap { height: 10px; background: #272c42; border-radius: 5px; margin-top: 16px; overflow: hidden; }
+  #levelBar { height: 100%; width: 0%; background: var(--accent); transition: width 0.05s linear; }
+
   canvas { width: 100%; height: 160px; background: #10131d; border-radius: 12px; display: block; }
 
   button {
@@ -89,6 +92,10 @@
     <div id="needle"></div>
   </div>
   <div class="meterLabels"><span>♭ flat</span><span>in tune</span><span>sharp ♯</span></div>
+
+  <!-- Mic level: if this bar never moves when you sing, the mic signal isn't arriving -->
+  <div id="levelWrap"><div id="levelBar"></div></div>
+  <div class="meterLabels"><span>mic level</span><span id="debug"></span></div>
 </div>
 
 <div class="card">
@@ -109,7 +116,7 @@ const FFT_SIZE        = 2048;   // audio window size. Bigger = more accurate for
 const MIN_FREQ        = 70;     // lowest note we look for (Hz). ~C#2
 const MAX_FREQ        = 1200;   // highest note we look for (Hz). ~D6
 const YIN_THRESHOLD   = 0.15;   // lower = stricter (fewer false notes), higher = more sensitive
-const VOLUME_GATE     = 0.01;   // ignore sounds quieter than this (stops background noise showing notes)
+const VOLUME_GATE     = 0.003;  // ignore sounds quieter than this (stops background noise showing notes)
 const HISTORY_SECONDS = 5;      // how much history the graph shows
 const IN_TUNE_CENTS   = 15;     // within this many cents = green
 
@@ -147,11 +154,13 @@ function midiToName(midi) {
    Finds the repeating period of the sound wave.
    Frequency = sampleRate / period.
    ===================================================== */
+let lastRms = 0;   // latest loudness, shown on the mic level bar
 function detectPitch(buffer, sampleRate) {
   // Volume check (RMS = average loudness)
   let sumSquares = 0;
   for (let i = 0; i < buffer.length; i++) sumSquares += buffer[i] * buffer[i];
   const rms = Math.sqrt(sumSquares / buffer.length);
+  lastRms = rms;
   if (rms < VOLUME_GATE) return -1;
 
   const windowSize = Math.floor(buffer.length / 2);
@@ -243,6 +252,8 @@ async function start() {
   }
 
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  // Mobile browsers often start audio "suspended" – this wakes it up
+  await audioCtx.resume();
   const source = audioCtx.createMediaStreamSource(stream);
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = FFT_SIZE;
@@ -272,6 +283,11 @@ function loop() {
 
   analyser.getFloatTimeDomainData(timeBuffer);
   const freq = detectPitch(timeBuffer, audioCtx.sampleRate);
+
+  // Update the mic level bar and debug text
+  document.getElementById('levelBar').style.width = Math.min(100, Math.sqrt(lastRms) * 250) + '%';
+  document.getElementById('debug').textContent =
+    audioCtx.state + ' · ' + audioCtx.sampleRate + 'Hz · vol ' + lastRms.toFixed(4);
 
   const now = performance.now();
   if (freq > 0) {
