@@ -36,12 +36,21 @@
     height: 100dvh;
     display: flex;
     flex-direction: column;
-    gap: 8px;
     padding: 10px;
     max-width: 640px;
     margin: 0 auto;
   }
   .card { background: var(--card); border-radius: 14px; padding: 10px 14px; }
+
+  /* Panels that slide away during a warmup (top readout slides up, settings slide down) */
+  .collapsible {
+    display: grid;
+    grid-template-rows: 1fr;
+    transition: grid-template-rows 0.45s ease, opacity 0.35s ease;
+  }
+  .collapsible > .inner { overflow: hidden; min-height: 0; }
+  .collapsible.collapsed { grid-template-rows: 0fr; opacity: 0; pointer-events: none; }
+  #topWrap > .inner { padding-bottom: 8px; }
 
   /* Compact readout */
   #top { flex: none; }
@@ -57,7 +66,7 @@
   #needle { position: absolute; top: 2px; bottom: 2px; left: 50%; width: 6px; margin-left: -3px; border-radius: 3px; background: var(--muted); }
 
   /* Big pitch graph fills all spare space */
-  #graphWrap { position: relative; flex: 1; min-height: 220px; background: #10131d; border-radius: 14px; overflow: hidden; }
+  #graphWrap { position: relative; flex: 1; min-height: 220px; background: #10131d; border-radius: 14px; overflow: hidden; margin-bottom: 8px; }
   canvas { width: 100%; height: 100%; display: block; }
 
   /* Warmup results popup (sits on top of the graph) */
@@ -86,6 +95,7 @@
   button.stop { background: var(--bad); }
   button:disabled { opacity: 0.4; }
   #status { color: var(--muted); font-size: 0.75rem; margin-top: 6px; text-align: center; }
+  #settingsWrap > .inner { padding-bottom: 2px; }
 
   /* Mode tabs (Free sing / Warmup) */
   .tabs { display: flex; gap: 6px; margin-bottom: 8px; }
@@ -104,16 +114,18 @@
 <body>
 <div id="app">
 
-  <div id="top" class="card">
-    <div id="readout">
-      <div id="note">–</div>
-      <div id="info">
-        <div id="freq">Press Start and sing a note</div>
-        <div id="centsText"></div>
+  <div id="topWrap" class="collapsible"><div class="inner">
+    <div id="top" class="card">
+      <div id="readout">
+        <div id="note">–</div>
+        <div id="info">
+          <div id="freq">Press Start and sing a note</div>
+          <div id="centsText"></div>
+        </div>
       </div>
+      <div id="meter"><div class="centre"></div><div id="needle"></div></div>
     </div>
-    <div id="meter"><div class="centre"></div><div id="needle"></div></div>
-  </div>
+  </div></div>
 
   <div id="graphWrap">
     <canvas id="history"></canvas>
@@ -128,10 +140,11 @@
   </div>
 
   <div id="bottom" class="card">
+   <div id="settingsWrap" class="collapsible"><div class="inner">
     <div class="row">
       <label>Mic boost</label>
-      <input id="gainSlider" type="range" min="0.1" max="20" step="0.1" value="3">
-      <span id="gainLabel">3.0×</span>
+      <input id="gainSlider" type="range" min="0.1" max="20" step="0.1" value="1">
+      <span id="gainLabel">1.0×</span>
     </div>
     <div id="levelWrap"><div id="levelBar"></div></div>
     <div id="levelText">mic level</div>
@@ -171,6 +184,7 @@
         <input id="syncSlider" type="range" min="-100" max="600" step="10" value="250">
       </div>
     </div>
+   </div></div>
 
     <button id="toggleBtn">Start</button>
     <div id="status">Tip: use headphones later when playing backing tracks.</div>
@@ -197,7 +211,10 @@ const VISIBLE_SECONDS   = 8;      // total seconds of time shown across the grap
 const NOW_POSITION      = 0.35;   // where the "now" line sits, as a fraction of the graph width from the left.
                                   // 0.35 = 35% in. Your pitch is drawn to the left of it;
                                   // the space to the right is reserved for upcoming target notes.
-const VIEW_SEMITONES    = 24;     // how many note lanes the graph shows at once (24 = 2 octaves)
+const FREE_VIEW_SEMITONES   = 24; // note lanes visible in Free sing mode (24 = 2 octaves)
+const WARMUP_VIEW_SEMITONES = 16; // note lanes visible during a warmup. Fewer lanes = taller notes.
+                                  // (a major scale spans 13 notes, so don't go much below 14)
+const HIDE_READOUT_IN_WARMUP = true;   // slide the top note readout away during warmups too
 const LABEL_WIDTH       = 46;     // width of the note-name column on the left of the graph (px)
 
 // --- Warmup settings ---
@@ -213,12 +230,18 @@ const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 const SHARP_PITCH_CLASSES = [1, 3, 6, 8, 10];   // C#, D#, F#, G#, A#
 
 // Warmup exercises. Each note is [semitones above the root note, length in beats].
+// BREATH is a rest: a gap to breathe. Scales with more than 5 notes use one between going up and coming down.
 // Want to add your own? Copy a line, give it a new key and name, and edit the numbers.
+const BREATH = [null, 2];     // [null, beats]
 const EXERCISES = {
   five:  { name: '5-note scale (up & down)',
            notes: [[0,1],[2,1],[4,1],[5,1],[7,1],[5,1],[4,1],[2,1],[0,2]] },
-  major: { name: 'Major scale (up & down)',
-           notes: [[0,1],[2,1],[4,1],[5,1],[7,1],[9,1],[11,1],[12,1],[11,1],[9,1],[7,1],[5,1],[4,1],[2,1],[0,2]] },
+  major: { name: 'Major scale (up, breathe, down)',
+           notes: [[0,1],[2,1],[4,1],[5,1],[7,1],[9,1],[11,1],[12,1], BREATH,
+                   [12,1],[11,1],[9,1],[7,1],[5,1],[4,1],[2,1],[0,2]] },
+  minorFull: { name: 'Minor scale (up, breathe, down)',
+           notes: [[0,1],[2,1],[3,1],[5,1],[7,1],[8,1],[10,1],[12,1], BREATH,
+                   [12,1],[10,1],[8,1],[7,1],[5,1],[3,1],[2,1],[0,2]] },
   arp:   { name: 'Arpeggio (1-3-5-8-5-3-1)',
            notes: [[0,1],[4,1],[7,1],[12,2],[7,1],[4,1],[0,2]] },
   minor: { name: 'Minor 5-note scale',
@@ -226,6 +249,9 @@ const EXERCISES = {
   long:  { name: 'Long tone (hold the root)',
            notes: [[0,8]] }
 };
+
+// Movable-do solfege names, by semitones above the root (0 = Do, 12 = Do again).
+const SOLFEGE = ['Do','Ra','Re','Me','Mi','Fa','Se','Sol','Le','La','Te','Ti'];
 
 /* =====================================================
    2. PAGE ELEMENTS
@@ -392,6 +418,9 @@ const history = [];   // { t: time in ms, midi: number or null }
 let viewCenter = 57;  // the note (MIDI number) at the vertical middle of the graph. 57 = A3.
                       // In free mode it follows your voice; in warmup mode it follows the target notes.
 
+let viewSemitones = FREE_VIEW_SEMITONES;   // how many note lanes are on screen right now
+let lastDrawNow = 0;  // the last time value passed to drawGraph (used to redraw when the layout changes)
+
 let mode = 'free';    // 'free' or 'warmup'
 let warmup = null;    // the running warmup (null when none is running)
 let pianoBus = null;  // volume control that all piano notes go through
@@ -473,7 +502,9 @@ function loop() {
         ? 'Get ready…'
         : 'Get ready… ' + count + '  (reference note: ' + midiToName(warmup.notes[0].midi) + ')';
     } else if (target) {
-      statusEl.textContent = 'Round ' + (target.round + 1) + ' of ' + warmup.rounds + ' – sing ' + midiToName(target.midi);
+      statusEl.textContent = 'Round ' + (target.round + 1) + ' of ' + warmup.rounds + ' – sing ' + target.label + ' (' + midiToName(target.midi) + ')';
+    } else if (warmup.rests.some(r => now >= r.startMs && now < r.endMs)) {
+      statusEl.textContent = 'Breathe…';
     }
   }
 
@@ -552,7 +583,7 @@ function showNothing() {
    ===================================================== */
 // Slide the visible note range up/down when a note gets near its edge.
 function followVoice(midi) {
-  const margin = VIEW_SEMITONES / 2 - 3;           // how far from centre before we start scrolling
+  const margin = viewSemitones / 2 - 2;            // how far from centre before we start scrolling
   if (midi > viewCenter + margin)      viewCenter += (midi - (viewCenter + margin)) * 0.1;
   else if (midi < viewCenter - margin) viewCenter += (midi - (viewCenter - margin)) * 0.1;
 }
@@ -575,8 +606,9 @@ function drawGraph(now) {
   ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx2d.clearRect(0, 0, w, h);
 
-  const lowMidi  = viewCenter - VIEW_SEMITONES / 2;
-  const highMidi = viewCenter + VIEW_SEMITONES / 2;
+  lastDrawNow = now;
+  const lowMidi  = viewCenter - viewSemitones / 2;
+  const highMidi = viewCenter + viewSemitones / 2;
   const yFor = m => h - ((m - lowMidi) / (highMidi - lowMidi)) * h;   // note number -> pixel row
   const plotLeft = LABEL_WIDTH;
   const plotWidth = w - plotLeft;
@@ -638,8 +670,19 @@ function drawGraph(now) {
 
   // --- warmup target notes: bars that scroll in from the right ---
   if (warmup) {
-    const laneH = h / VIEW_SEMITONES;
+    const laneH = h / viewSemitones;
     const barH = laneH * 0.78;
+
+    // "breathe" markers in the gaps between notes (breaths and the pause between rounds)
+    ctx2d.fillStyle = 'rgba(242,244,250,0.3)';
+    ctx2d.font = 'italic 13px system-ui';
+    ctx2d.textAlign = 'center';
+    for (const r of warmup.rests) {
+      const rx1 = nowX + ((r.startMs - now) / 1000) * pxPerSec;
+      const rx2 = nowX + ((r.endMs - now) / 1000) * pxPerSec;
+      if (rx2 < plotLeft || rx1 > w || rx2 - rx1 < 44) continue;
+      ctx2d.fillText('breathe', (rx1 + rx2) / 2, h / 2);
+    }
     for (const n of warmup.notes) {
       const x1 = nowX + ((n.startMs - now) / 1000) * pxPerSec + 2;
       const x2 = nowX + ((n.endMs - now) / 1000) * pxPerSec - 2;
@@ -666,12 +709,19 @@ function drawGraph(now) {
         ctx2d.stroke();
       }
 
-      // note name inside the bar (if it's wide enough)
-      if (x2 - x1 > 34) {
+      // what to sing, inside the bar: the solfege name (Do, Re, Mi...), plus the note name if there's room
+      const textX = Math.max(x1, plotLeft) + 6;
+      if (x2 - x1 > 26) {
         ctx2d.fillStyle = '#0d1020';
-        ctx2d.font = 'bold 11px system-ui';
+        ctx2d.font = 'bold ' + Math.round(Math.max(11, Math.min(18, barH * 0.5))) + 'px system-ui';
         ctx2d.textAlign = 'left';
-        ctx2d.fillText(midiToName(n.midi), Math.max(x1, plotLeft) + 6, yc);
+        ctx2d.fillText(n.label, textX, yc);
+        if (x2 - x1 > 90) {
+          ctx2d.font = '11px system-ui';
+          ctx2d.textAlign = 'right';
+          ctx2d.fillStyle = 'rgba(13,16,32,0.7)';
+          ctx2d.fillText(midiToName(n.midi), x2 - 6, yc);
+        }
       }
     }
 
@@ -839,11 +889,18 @@ function beginWarmup() {
 
   // Build the full list of target notes, with start/end times
   const notes = [];
+  const rests = [];                          // gaps to breathe in (shown on the graph, no scoring)
   let cursor = t0;
   for (let r = 0; r < rounds; r++) {
     for (const [semitones, beats] of exercise.notes) {
+      if (semitones === null) {              // a breath: leave a gap
+        rests.push({ startMs: cursor, endMs: cursor + beats * beatMs });
+        cursor += beats * beatMs;
+        continue;
+      }
       notes.push({
         midi: root + r + semitones,        // each round starts 1 semitone higher
+        label: SOLFEGE[((semitones % 12) + 12) % 12],
         startMs: cursor,
         endMs: cursor + beats * beatMs,
         round: r,
@@ -851,11 +908,13 @@ function beginWarmup() {
       });
       cursor += beats * beatMs;
     }
+    if (r < rounds - 1) rests.push({ startMs: cursor, endMs: cursor + REST_BEATS * beatMs });
     cursor += REST_BEATS * beatMs;           // short rest between rounds
   }
 
   warmup = {
     notes: notes,
+    rests: rests,
     rounds: rounds,
     beatMs: beatMs,
     anyOctave: octaveChk.checked,
@@ -863,6 +922,7 @@ function beginWarmup() {
   };
 
   history.length = 0;
+  viewSemitones = WARMUP_VIEW_SEMITONES;      // fewer lanes = taller notes
   viewCenter = root + 5 + (rounds - 1) / 2;   // start with the notes in view
 
   // Schedule the sounds on the audio clock so the timing is precise
@@ -898,7 +958,14 @@ function beginWarmup() {
   }
 
   setModeButtonsEnabled(false);
+  setPanelsCollapsed(true);                   // settings slide away; only the map + Stop button remain
   refreshButton();
+}
+
+// Slides the settings down (and the top readout up) out of view, or brings them back
+function setPanelsCollapsed(collapsed) {
+  document.getElementById('settingsWrap').classList.toggle('collapsed', collapsed);
+  if (HIDE_READOUT_IN_WARMUP) document.getElementById('topWrap').classList.toggle('collapsed', collapsed);
 }
 
 function cancelWarmup() {
@@ -906,6 +973,8 @@ function cancelWarmup() {
   endPiano();
   stop();
   setModeButtonsEnabled(true);
+  setPanelsCollapsed(false);
+  viewSemitones = FREE_VIEW_SEMITONES;
   statusEl.textContent = 'Warmup stopped.';
 }
 
@@ -915,6 +984,8 @@ function finishWarmup() {
   endPiano();
   stop();
   setModeButtonsEnabled(true);
+  setPanelsCollapsed(false);
+  viewSemitones = FREE_VIEW_SEMITONES;
   statusEl.textContent = 'Warmup complete.';
 
   // Add everything up
@@ -1003,7 +1074,7 @@ resClose.addEventListener('click', () => { resultsEl.hidden = true; });
 gainSlider.addEventListener('input', () => {
   gainLabel.textContent = Number(gainSlider.value).toFixed(1) + '×';
   if (gainNode) gainNode.gain.value = Number(gainSlider.value);
-  try { localStorage.setItem('singAppGain', gainSlider.value); } catch (e) {}
+  try { localStorage.setItem('singAppGainV2', gainSlider.value); } catch (e) {}
 });
 
 // Guide volume slider (piano + metronome), works live
@@ -1015,7 +1086,7 @@ volSlider.addEventListener('input', () => {
 
 // Restore saved slider positions
 try {
-  const savedGain = localStorage.getItem('singAppGain');
+  const savedGain = localStorage.getItem('singAppGainV2');   // (V2: resets everyone to the new 1x default once)
   if (savedGain !== null) gainSlider.value = savedGain;
   const savedVol = localStorage.getItem('singAppVolume');
   if (savedVol !== null) volSlider.value = savedVol;
@@ -1053,7 +1124,9 @@ for (let m = 48; m <= 72; m++) {            // C3 up to C5
 
 // Draw the empty graph straight away so the layout is visible before pressing Start
 drawGraph(performance.now());
-window.addEventListener('resize', () => drawGraph(performance.now()));
+// Redraw whenever the graph changes size (window resize, or the settings sliding away/back)
+new ResizeObserver(() => drawGraph(running ? performance.now() : lastDrawNow))
+  .observe(document.getElementById('graphWrap'));
 </script>
 </body>
 </html>
