@@ -207,14 +207,16 @@ const CLOSE_CENTS       = 35;     // within this many cents = yellow, beyond = r
 const DISPLAY_SMOOTHING = 0.12;   // how much the big note/cents readout smooths out wobble.
                                   // smaller = steadier but slower to react (try 0.05 – 0.3)
 
-const VISIBLE_SECONDS   = 8;      // total seconds of time shown across the graph (past + future)
+const FREE_VISIBLE_SECONDS   = 8; // seconds of time shown across the graph in Free sing mode
+const WARMUP_VISIBLE_SECONDS = 4; // seconds shown across the graph during a warmup.
+                                  // Fewer seconds = longer boxes and a faster-scrolling map (try 3 – 6)
 const NOW_POSITION      = 0.35;   // where the "now" line sits, as a fraction of the graph width from the left.
                                   // 0.35 = 35% in. Your pitch is drawn to the left of it;
                                   // the space to the right is reserved for upcoming target notes.
 const FREE_VIEW_SEMITONES   = 24; // note lanes visible in Free sing mode (24 = 2 octaves)
-const WARMUP_VIEW_SEMITONES = 16; // note lanes visible during a warmup. Fewer lanes = taller notes.
+const WARMUP_VIEW_SEMITONES = 20; // note lanes visible during a warmup. Fewer lanes = taller notes.
                                   // (a major scale spans 13 notes, so don't go much below 14)
-const HIDE_READOUT_IN_WARMUP = true;   // slide the top note readout away during warmups too
+const HIDE_READOUT_IN_WARMUP = false;  // set to true to slide the top note readout away during warmups
 const LABEL_WIDTH       = 46;     // width of the note-name column on the left of the graph (px)
 
 // --- Warmup settings ---
@@ -232,14 +234,14 @@ const SHARP_PITCH_CLASSES = [1, 3, 6, 8, 10];   // C#, D#, F#, G#, A#
 // Warmup exercises. Each note is [semitones above the root note, length in beats].
 // BREATH is a rest: a gap to breathe. Scales with more than 5 notes use one between going up and coming down.
 // Want to add your own? Copy a line, give it a new key and name, and edit the numbers.
-const BREATH = [null, 2];     // [null, beats]
+const BREATH = [null, 1];     // [null, beats]: a silent pause of 1 beat
 const EXERCISES = {
   five:  { name: '5-note scale (up & down)',
            notes: [[0,1],[2,1],[4,1],[5,1],[7,1],[5,1],[4,1],[2,1],[0,2]] },
-  major: { name: 'Major scale (up, breathe, down)',
+  major: { name: 'Major scale (up & down)',
            notes: [[0,1],[2,1],[4,1],[5,1],[7,1],[9,1],[11,1],[12,1], BREATH,
                    [12,1],[11,1],[9,1],[7,1],[5,1],[4,1],[2,1],[0,2]] },
-  minorFull: { name: 'Minor scale (up, breathe, down)',
+  minorFull: { name: 'Minor scale (up & down)',
            notes: [[0,1],[2,1],[3,1],[5,1],[7,1],[8,1],[10,1],[12,1], BREATH,
                    [12,1],[10,1],[8,1],[7,1],[5,1],[3,1],[2,1],[0,2]] },
   arp:   { name: 'Arpeggio (1-3-5-8-5-3-1)',
@@ -419,6 +421,7 @@ let viewCenter = 57;  // the note (MIDI number) at the vertical middle of the gr
                       // In free mode it follows your voice; in warmup mode it follows the target notes.
 
 let viewSemitones = FREE_VIEW_SEMITONES;   // how many note lanes are on screen right now
+let visibleSeconds = FREE_VISIBLE_SECONDS; // how many seconds of time are across the graph right now
 let lastDrawNow = 0;  // the last time value passed to drawGraph (used to redraw when the layout changes)
 
 let mode = 'free';    // 'free' or 'warmup'
@@ -503,8 +506,6 @@ function loop() {
         : 'Get ready… ' + count + '  (reference note: ' + midiToName(warmup.notes[0].midi) + ')';
     } else if (target) {
       statusEl.textContent = 'Round ' + (target.round + 1) + ' of ' + warmup.rounds + ' – sing ' + target.label + ' (' + midiToName(target.midi) + ')';
-    } else if (warmup.rests.some(r => now >= r.startMs && now < r.endMs)) {
-      statusEl.textContent = 'Breathe…';
     }
   }
 
@@ -540,7 +541,7 @@ function loop() {
   }
 
   // drop history older than the window
-  const cutoff = now - VISIBLE_SECONDS * NOW_POSITION * 1000;
+  const cutoff = now - visibleSeconds * NOW_POSITION * 1000;
   while (history.length && history[0].t < cutoff) history.shift();
 
   drawGraph(now);
@@ -625,7 +626,7 @@ function drawGraph(now) {
 
   // Time -> horizontal position. "now" sits partway across; the past scrolls off to the left.
   const nowX = plotLeft + plotWidth * NOW_POSITION;
-  const pxPerSec = plotWidth / VISIBLE_SECONDS;
+  const pxPerSec = plotWidth / visibleSeconds;
 
   // --- note lanes: each note owns a band centred on its exact pitch ---
   ctx2d.textBaseline = 'middle';
@@ -673,16 +674,6 @@ function drawGraph(now) {
     const laneH = h / viewSemitones;
     const barH = laneH * 0.78;
 
-    // "breathe" markers in the gaps between notes (breaths and the pause between rounds)
-    ctx2d.fillStyle = 'rgba(242,244,250,0.3)';
-    ctx2d.font = 'italic 13px system-ui';
-    ctx2d.textAlign = 'center';
-    for (const r of warmup.rests) {
-      const rx1 = nowX + ((r.startMs - now) / 1000) * pxPerSec;
-      const rx2 = nowX + ((r.endMs - now) / 1000) * pxPerSec;
-      if (rx2 < plotLeft || rx1 > w || rx2 - rx1 < 44) continue;
-      ctx2d.fillText('breathe', (rx1 + rx2) / 2, h / 2);
-    }
     for (const n of warmup.notes) {
       const x1 = nowX + ((n.startMs - now) / 1000) * pxPerSec + 2;
       const x2 = nowX + ((n.endMs - now) / 1000) * pxPerSec - 2;
@@ -710,13 +701,21 @@ function drawGraph(now) {
       }
 
       // what to sing, inside the bar: the solfege name (Do, Re, Mi...), plus the note name if there's room
-      const textX = Math.max(x1, plotLeft) + 6;
-      if (x2 - x1 > 26) {
+      const boxW = x2 - x1;
+      if (boxW > 14) {
+        // start at a nice size, shrink the text if the box is too narrow for it
+        let fs = Math.round(Math.max(11, Math.min(20, barH * 0.55)));
+        ctx2d.font = 'bold ' + fs + 'px system-ui';
+        while (fs > 8 && ctx2d.measureText(n.label).width > boxW - 10) {
+          fs--;
+          ctx2d.font = 'bold ' + fs + 'px system-ui';
+        }
+        const labelW = ctx2d.measureText(n.label).width;
         ctx2d.fillStyle = '#0d1020';
-        ctx2d.font = 'bold ' + Math.round(Math.max(11, Math.min(18, barH * 0.5))) + 'px system-ui';
         ctx2d.textAlign = 'left';
-        ctx2d.fillText(n.label, textX, yc);
-        if (x2 - x1 > 90) {
+        ctx2d.fillText(n.label, Math.max(x1, plotLeft) + 6, yc);
+        // note name too (e.g. E4), if the box is long enough to hold both
+        if (boxW > labelW + 56) {
           ctx2d.font = '11px system-ui';
           ctx2d.textAlign = 'right';
           ctx2d.fillStyle = 'rgba(13,16,32,0.7)';
@@ -923,6 +922,7 @@ function beginWarmup() {
 
   history.length = 0;
   viewSemitones = WARMUP_VIEW_SEMITONES;      // fewer lanes = taller notes
+  visibleSeconds = WARMUP_VISIBLE_SECONDS;    // fewer seconds = longer boxes, faster scroll
   viewCenter = root + 5 + (rounds - 1) / 2;   // start with the notes in view
 
   // Schedule the sounds on the audio clock so the timing is precise
@@ -975,6 +975,7 @@ function cancelWarmup() {
   setModeButtonsEnabled(true);
   setPanelsCollapsed(false);
   viewSemitones = FREE_VIEW_SEMITONES;
+  visibleSeconds = FREE_VISIBLE_SECONDS;
   statusEl.textContent = 'Warmup stopped.';
 }
 
@@ -986,6 +987,7 @@ function finishWarmup() {
   setModeButtonsEnabled(true);
   setPanelsCollapsed(false);
   viewSemitones = FREE_VIEW_SEMITONES;
+  visibleSeconds = FREE_VISIBLE_SECONDS;
   statusEl.textContent = 'Warmup complete.';
 
   // Add everything up
