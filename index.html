@@ -49,7 +49,13 @@
     transition: grid-template-rows 0.45s ease, opacity 0.35s ease;
   }
   .collapsible > .inner { overflow: hidden; min-height: 0; }
-  .collapsible.collapsed { grid-template-rows: 0fr; opacity: 0; pointer-events: none; }
+  .collapsible.collapsed {
+    grid-template-rows: 0fr; opacity: 0; pointer-events: none; visibility: hidden;
+    transition: grid-template-rows 0.45s ease, opacity 0.35s ease, visibility 0s 0.45s;
+  }
+  .moreBtn { background: none; color: var(--muted); font-size: 0.8rem; font-weight: 500; padding: 6px; margin-bottom: 6px; }
+  #moreArrow { display: inline-block; transition: transform 0.3s ease; }
+  .moreBtn.open #moreArrow { transform: rotate(180deg); }
   #topWrap > .inner { padding-bottom: 8px; }
 
   /* Compact readout */
@@ -141,13 +147,6 @@
 
   <div id="bottom" class="card">
    <div id="settingsWrap" class="collapsible"><div class="inner">
-    <div class="row">
-      <label>Mic boost</label>
-      <input id="gainSlider" type="range" min="0.1" max="20" step="0.1" value="1">
-      <span id="gainLabel">1.0×</span>
-    </div>
-    <div id="levelWrap"><div id="levelBar"></div></div>
-    <div id="levelText">mic level</div>
 
     <div class="tabs">
       <button id="modeFree" class="tab active">Free sing</button>
@@ -170,20 +169,37 @@
           <input id="bpmSlider" type="range" min="50" max="140" step="5" value="80">
         </label>
       </div>
-      <div class="checks">
-        <label><input type="checkbox" id="pianoChk" checked> Piano guide</label>
-        <label><input type="checkbox" id="metroChk" checked> Metronome</label>
-        <label><input type="checkbox" id="octaveChk" checked> Any octave</label>
-      </div>
-      <div class="row">
-        <label>Guide volume <span id="volLabel">300%</span></label>
-        <input id="volSlider" type="range" min="50" max="800" step="10" value="300">
-      </div>
-      <div class="row">
-        <label>Audio sync <span id="syncLabel">250 ms</span></label>
-        <input id="syncSlider" type="range" min="-100" max="600" step="10" value="250">
-      </div>
     </div>
+
+    <button id="moreBtn" class="moreBtn" aria-expanded="false">More settings <span id="moreArrow">▾</span></button>
+
+    <!-- Extra settings: hidden until you tap "More settings" -->
+    <div id="moreWrap" class="collapsible collapsed"><div class="inner">
+      <div class="row">
+        <label>Mic boost</label>
+        <input id="gainSlider" type="range" min="0.1" max="20" step="0.1" value="1">
+        <span id="gainLabel">1.0×</span>
+      </div>
+      <div id="levelWrap"><div id="levelBar"></div></div>
+      <div id="levelText">mic level</div>
+
+      <div id="moreWarmup" hidden>
+        <div class="checks">
+          <label><input type="checkbox" id="pianoChk" checked> Piano guide</label>
+          <label><input type="checkbox" id="metroChk" checked> Metronome</label>
+          <label><input type="checkbox" id="octaveChk" checked> Any octave</label>
+        </div>
+        <div class="row">
+          <label>Guide volume <span id="volLabel">300%</span></label>
+          <input id="volSlider" type="range" min="50" max="800" step="10" value="300">
+        </div>
+        <div class="row">
+          <label>Audio sync <span id="syncLabel">250 ms</span></label>
+          <input id="syncSlider" type="range" min="-100" max="600" step="10" value="250">
+        </div>
+      </div>
+    </div></div>
+
    </div></div>
 
     <button id="toggleBtn">Start</button>
@@ -210,8 +226,8 @@ const DISPLAY_SMOOTHING = 0.12;   // how much the big note/cents readout smooths
 const FREE_VISIBLE_SECONDS   = 8; // seconds of time shown across the graph in Free sing mode
 const WARMUP_VISIBLE_SECONDS = 6; // seconds shown across the graph during a warmup.
                                   // Fewer seconds = longer boxes and a faster-scrolling map (try 3 – 6)
-const NOW_POSITION      = 0.25;   // where the "now" line sits, as a fraction of the graph width from the left.
-                                  // 0.35 = 35% in. Your pitch is drawn to the left of it;
+const NOW_POSITION      = 0.33;   // where the "now" line sits, as a fraction of the graph width from the left.
+                                  // 0.33 = a third of the way in. Your pitch is drawn to the left of it;
                                   // the space to the right is reserved for upcoming target notes.
 const FREE_VIEW_SEMITONES   = 24; // note lanes visible in Free sing mode (24 = 2 octaves)
 const WARMUP_VIEW_SEMITONES = 20; // note lanes visible during a warmup. Fewer lanes = taller notes.
@@ -1048,12 +1064,21 @@ function setMode(newMode) {
   modeFreeBtn.classList.toggle('active', mode === 'free');
   modeWarmupBtn.classList.toggle('active', mode === 'warmup');
   warmupControls.hidden = (mode !== 'warmup');
+  document.getElementById('moreWarmup').hidden = (mode !== 'warmup');   // guide sounds/sync only matter in warmups
   resultsEl.hidden = true;
   refreshButton();
   statusEl.textContent = mode === 'warmup'
     ? 'Use wired headphones if the piano is on, or the mic will hear it.'
     : 'Tip: use headphones later when playing backing tracks.';
 }
+
+// "More settings" button: slides the extra settings open/closed
+const moreBtn = document.getElementById('moreBtn');
+moreBtn.addEventListener('click', () => {
+  const nowOpen = document.getElementById('moreWrap').classList.toggle('collapsed') === false;
+  moreBtn.classList.toggle('open', nowOpen);
+  moreBtn.setAttribute('aria-expanded', nowOpen ? 'true' : 'false');
+});
 
 modeFreeBtn.addEventListener('click', () => setMode('free'));
 modeWarmupBtn.addEventListener('click', () => setMode('warmup'));
