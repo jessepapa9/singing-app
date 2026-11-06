@@ -81,6 +81,7 @@
   #gainLabel { color: var(--muted); font-size: 0.8rem; min-width: 2.5rem; text-align: right; }
   #levelWrap { height: 6px; background: #272c42; border-radius: 3px; overflow: hidden; margin-bottom: 8px; }
   #levelBar { height: 100%; width: 0%; background: var(--accent); }
+  #levelText { color: var(--muted); font-size: 0.7rem; text-align: right; margin: -4px 0 8px; min-height: 0.9rem; }
   button { background: var(--accent); color: white; border: 0; font-size: 1.05rem; font-weight: 600; padding: 12px; border-radius: 12px; width: 100%; }
   button.stop { background: var(--bad); }
   button:disabled { opacity: 0.4; }
@@ -129,10 +130,11 @@
   <div id="bottom" class="card">
     <div class="row">
       <label>Mic boost</label>
-      <input id="gainSlider" type="range" min="1" max="40" step="1" value="10">
-      <span id="gainLabel">10×</span>
+      <input id="gainSlider" type="range" min="0.1" max="20" step="0.1" value="3">
+      <span id="gainLabel">3.0×</span>
     </div>
     <div id="levelWrap"><div id="levelBar"></div></div>
+    <div id="levelText">mic level</div>
 
     <div class="tabs">
       <button id="modeFree" class="tab active">Free sing</button>
@@ -161,8 +163,12 @@
         <label><input type="checkbox" id="octaveChk" checked> Any octave</label>
       </div>
       <div class="row">
-        <label>Audio sync <span id="syncLabel">0 ms</span></label>
-        <input id="syncSlider" type="range" min="-100" max="600" step="10" value="0">
+        <label>Guide volume <span id="volLabel">300%</span></label>
+        <input id="volSlider" type="range" min="50" max="800" step="10" value="300">
+      </div>
+      <div class="row">
+        <label>Audio sync <span id="syncLabel">250 ms</span></label>
+        <input id="syncSlider" type="range" min="-100" max="600" step="10" value="250">
       </div>
     </div>
 
@@ -200,7 +206,7 @@ const GRACE_SECONDS     = 0.3;    // at the start of each note, ignore this long
 const REST_BEATS        = 1;      // silent gap between rounds (in beats)
 const TIGHT_CENTS       = 25;     // within this many cents of the target = full points
 const LOOSE_CENTS       = 50;     // within this many cents = half points, further away = 0
-const METRONOME_VOLUME  = 0.1;    // metronome click loudness (0 = silent, 0.1 = quiet, 0.3 = loud)
+const METRONOME_VOLUME  = 0.2;    // metronome click loudness relative to the piano (0 = silent, 0.1 = quiet, 0.4 = loud)
 
 const COLOURS = { good: '#3ddc97', ok: '#ffc857', bad: '#ff5d73', muted: '#8a92ab', line: '#6c8cff' };
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
@@ -233,6 +239,9 @@ const btn        = document.getElementById('toggleBtn');
 const gainSlider = document.getElementById('gainSlider');
 const gainLabel  = document.getElementById('gainLabel');
 const levelBar   = document.getElementById('levelBar');
+const levelText  = document.getElementById('levelText');
+const volSlider  = document.getElementById('volSlider');
+const volLabel   = document.getElementById('volLabel');
 const canvas     = document.getElementById('history');
 const ctx2d      = canvas.getContext('2d');
 
@@ -278,13 +287,20 @@ function midiToName(midi) {
    Finds the repeating period of the sound wave.
    Frequency = sampleRate / period.
    ===================================================== */
-let lastRms = 0;   // latest loudness, shown on the mic level bar
+let lastRms = 0;    // latest loudness (average), shown on the mic level bar
+let lastPeak = 0;   // latest loudest single sample – if this hits ~1 the sound is clipping (too loud)
 function detectPitch(buffer, sampleRate) {
   // Volume check (RMS = average loudness)
   let sumSquares = 0;
-  for (let i = 0; i < buffer.length; i++) sumSquares += buffer[i] * buffer[i];
+  let peak = 0;
+  for (let i = 0; i < buffer.length; i++) {
+    sumSquares += buffer[i] * buffer[i];
+    const a = Math.abs(buffer[i]);
+    if (a > peak) peak = a;
+  }
   const rms = Math.sqrt(sumSquares / buffer.length);
   lastRms = rms;
+  lastPeak = peak;
   if (rms < VOLUME_GATE) return -1;
 
   const windowSize = Math.floor(buffer.length / 2);
@@ -430,7 +446,12 @@ function loop() {
   analyser.getFloatTimeDomainData(timeBuffer);
   const freq = detectPitch(timeBuffer, audioCtx.sampleRate);
 
-  levelBar.style.width = Math.min(100, Math.sqrt(lastRms) * 250) + '%';
+  // Level meter in decibels: empty = -60 dB, full = 0 dB. Red = too loud (clipping).
+  const db = lastRms > 0 ? 20 * Math.log10(lastRms) : -100;
+  const tooLoud = lastPeak >= 0.98;
+  levelBar.style.width = Math.max(0, Math.min(100, (db + 60) / 60 * 100)) + '%';
+  levelBar.style.background = tooLoud ? COLOURS.bad : COLOURS.line;
+  levelText.textContent = 'mic ' + Math.round(db) + ' dB' + (tooLoud ? ' – TOO LOUD, lower the mic boost' : '');
 
   const now = performance.now();
   const dt = lastFrameTime ? Math.min(now - lastFrameTime, 100) : 16;   // ms since the last frame
@@ -725,7 +746,7 @@ function targetsAt(now) {
 function playPianoNote(freq, when, dur) {
   const partials = [[1, 1.0], [2, 0.5], [3, 0.28], [4, 0.14], [5, 0.07]];   // [multiple of base freq, loudness]
   const norm = partials.reduce((sum, p) => sum + p[1], 0);
-  const peak = 0.35;                                                       // overall loudness of the piano
+  const peak = 0.5;                                                        // loudness of the piano (before the Guide volume slider)
 
   const env = audioCtx.createGain();
   env.gain.setValueAtTime(0.0001, when);
@@ -768,9 +789,28 @@ function autoSyncMs() {
   return ((audioCtx.outputLatency || 0) + (audioCtx.baseLatency || 0)) * 1000;
 }
 
+// All guide sounds (piano + metronome) go through one volume control and a limiter,
+// so the Guide volume slider can go loud without crackling.
+let outBus = null;
+function getOutBus() {
+  if (!outBus) {
+    outBus = audioCtx.createGain();
+    outBus.gain.value = Number(volSlider.value) / 100;
+    const limiter = audioCtx.createDynamicsCompressor();
+    limiter.threshold.value = -6;
+    limiter.knee.value = 0;
+    limiter.ratio.value = 20;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.1;
+    outBus.connect(limiter);
+    limiter.connect(audioCtx.destination);
+  }
+  return outBus;
+}
+
 // Silence any piano notes and clicks that haven't played yet
 function endPiano() {
-  for (const bus of [pianoBus, clickBus]) {
+  for (const bus of [pianoBus, clickBus, outBus]) {
     if (bus) {
       try {
         bus.gain.cancelScheduledValues(0);
@@ -781,6 +821,7 @@ function endPiano() {
   }
   pianoBus = null;
   clickBus = null;
+  outBus = null;
 }
 
 function beginWarmup() {
@@ -828,7 +869,7 @@ function beginWarmup() {
   if (pianoChk.checked) {
     pianoBus = audioCtx.createGain();
     pianoBus.gain.value = 1;
-    pianoBus.connect(audioCtx.destination);
+    pianoBus.connect(getOutBus());
     // reference note: the first note of the exercise is held during the count-in
     playPianoNote(midiToFreq(notes[0].midi), audioT0 - leadMs / 1000, Math.max(0.3, leadMs / 1000 - 0.1));
     for (const n of notes) {
@@ -840,7 +881,7 @@ function beginWarmup() {
   if (metroChk.checked && METRONOME_VOLUME > 0) {
     clickBus = audioCtx.createGain();
     clickBus.gain.value = 1;
-    clickBus.connect(audioCtx.destination);
+    clickBus.connect(getOutBus());
     // clicks during the count-in
     for (let k = 1; k <= LEAD_IN_BEATS; k++) {
       playClick(audioT0 - (k * beatMs) / 1000, false);
@@ -960,9 +1001,27 @@ btn.addEventListener('click', async () => {
 resClose.addEventListener('click', () => { resultsEl.hidden = true; });
 
 gainSlider.addEventListener('input', () => {
-  gainLabel.textContent = gainSlider.value + '×';
+  gainLabel.textContent = Number(gainSlider.value).toFixed(1) + '×';
   if (gainNode) gainNode.gain.value = Number(gainSlider.value);
+  try { localStorage.setItem('singAppGain', gainSlider.value); } catch (e) {}
 });
+
+// Guide volume slider (piano + metronome), works live
+volSlider.addEventListener('input', () => {
+  volLabel.textContent = volSlider.value + '%';
+  if (outBus) outBus.gain.value = Number(volSlider.value) / 100;
+  try { localStorage.setItem('singAppVolume', volSlider.value); } catch (e) {}
+});
+
+// Restore saved slider positions
+try {
+  const savedGain = localStorage.getItem('singAppGain');
+  if (savedGain !== null) gainSlider.value = savedGain;
+  const savedVol = localStorage.getItem('singAppVolume');
+  if (savedVol !== null) volSlider.value = savedVol;
+} catch (e) {}
+gainLabel.textContent = Number(gainSlider.value).toFixed(1) + '×';
+volLabel.textContent = volSlider.value + '%';
 
 bpmSlider.addEventListener('input', () => { bpmLabel.textContent = bpmSlider.value; });
 
