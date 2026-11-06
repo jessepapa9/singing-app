@@ -96,7 +96,7 @@
   .grid label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 0.75rem; }
   select { background: #272c42; color: var(--text); border: 0; border-radius: 8px; padding: 8px; font-size: 0.9rem; width: 100%; }
   .grid input[type=range] { width: 100%; }
-  .checks { display: flex; gap: 18px; margin-bottom: 8px; color: var(--muted); font-size: 0.85rem; }
+  .checks { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-bottom: 8px; color: var(--muted); font-size: 0.85rem; }
   .checks label { display: flex; align-items: center; gap: 6px; }
 </style>
 </head>
@@ -157,7 +157,12 @@
       </div>
       <div class="checks">
         <label><input type="checkbox" id="pianoChk" checked> Piano guide</label>
+        <label><input type="checkbox" id="metroChk" checked> Metronome</label>
         <label><input type="checkbox" id="octaveChk" checked> Any octave</label>
+      </div>
+      <div class="row">
+        <label>Audio sync <span id="syncLabel">0 ms</span></label>
+        <input id="syncSlider" type="range" min="-100" max="600" step="10" value="0">
       </div>
     </div>
 
@@ -190,12 +195,12 @@ const VIEW_SEMITONES    = 24;     // how many note lanes the graph shows at once
 const LABEL_WIDTH       = 46;     // width of the note-name column on the left of the graph (px)
 
 // --- Warmup settings ---
-const LEAD_IN_SECONDS   = 3;      // countdown before the first target note arrives
+const LEAD_IN_BEATS     = 3;      // count-in length: "3, 2, 1" (one count per beat, with a click on each)
 const GRACE_SECONDS     = 0.3;    // at the start of each note, ignore this long while you find the pitch
 const REST_BEATS        = 1;      // silent gap between rounds (in beats)
 const TIGHT_CENTS       = 25;     // within this many cents of the target = full points
 const LOOSE_CENTS       = 50;     // within this many cents = half points, further away = 0
-const PIANO_LATENCY_SECONDS = 0;  // if the piano sounds LATE compared to the bars, raise this (try 0.1)
+const METRONOME_VOLUME  = 0.1;    // metronome click loudness (0 = silent, 0.1 = quiet, 0.3 = loud)
 
 const COLOURS = { good: '#3ddc97', ok: '#ffc857', bad: '#ff5d73', muted: '#8a92ab', line: '#6c8cff' };
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
@@ -241,6 +246,9 @@ const bpmSlider     = document.getElementById('bpmSlider');
 const bpmLabel      = document.getElementById('bpmLabel');
 const pianoChk      = document.getElementById('pianoChk');
 const octaveChk     = document.getElementById('octaveChk');
+const metroChk      = document.getElementById('metroChk');
+const syncSlider    = document.getElementById('syncSlider');
+const syncLabel     = document.getElementById('syncLabel');
 const resultsEl     = document.getElementById('results');
 const resPct        = document.getElementById('resPct');
 const resText       = document.getElementById('resText');
@@ -371,6 +379,7 @@ let viewCenter = 57;  // the note (MIDI number) at the vertical middle of the gr
 let mode = 'free';    // 'free' or 'warmup'
 let warmup = null;    // the running warmup (null when none is running)
 let pianoBus = null;  // volume control that all piano notes go through
+let clickBus = null;  // volume control for the metronome clicks
 
 async function start() {
   try {
@@ -438,7 +447,10 @@ function loop() {
 
     const secondsToStart = (warmup.notes[0].startMs - now) / 1000;
     if (secondsToStart > 0) {
-      statusEl.textContent = 'Get ready… ' + Math.ceil(secondsToStart);
+      const count = Math.ceil(secondsToStart / (warmup.beatMs / 1000));
+      statusEl.textContent = count > LEAD_IN_BEATS
+        ? 'Get ready…'
+        : 'Get ready… ' + count + '  (reference note: ' + midiToName(warmup.notes[0].midi) + ')';
     } else if (target) {
       statusEl.textContent = 'Round ' + (target.round + 1) + ' of ' + warmup.rounds + ' – sing ' + midiToName(target.midi);
     }
@@ -551,7 +563,11 @@ function drawGraph(now) {
   // Which lane to highlight: the target note during a warmup, otherwise the note you're singing
   const activeTarget = warmup ? targetsAt(now).current : null;
   let activeNote = null;
-  if (warmup) activeNote = activeTarget ? activeTarget.midi : null;
+  if (warmup) {
+    // during the count-in, highlight the first note (that's the reference note you hear)
+    const beforeStart = now < warmup.notes[0].startMs;
+    activeNote = activeTarget ? activeTarget.midi : (beforeStart ? warmup.notes[0].midi : null);
+  }
   else if (displayMidi !== null) activeNote = Math.round(displayMidi);
 
   // Time -> horizontal position. "now" sits partway across; the past scrolls off to the left.
@@ -638,13 +654,16 @@ function drawGraph(now) {
       }
     }
 
-    // big countdown number before the first note
+    // big countdown number (3, 2, 1) before the first note – one number per beat
     const secondsToStart = (warmup.notes[0].startMs - now) / 1000;
     if (secondsToStart > 0) {
-      ctx2d.fillStyle = 'rgba(242,244,250,0.85)';
-      ctx2d.font = 'bold 64px system-ui';
-      ctx2d.textAlign = 'center';
-      ctx2d.fillText(String(Math.ceil(secondsToStart)), plotLeft + plotWidth * 0.6, h / 2);
+      const count = Math.ceil(secondsToStart / (warmup.beatMs / 1000));
+      if (count <= LEAD_IN_BEATS) {
+        ctx2d.fillStyle = 'rgba(242,244,250,0.85)';
+        ctx2d.font = 'bold 64px system-ui';
+        ctx2d.textAlign = 'center';
+        ctx2d.fillText(String(count), plotLeft + plotWidth * 0.6, h / 2);
+      }
     }
   }
 
@@ -728,16 +747,40 @@ function playPianoNote(freq, when, dur) {
   }
 }
 
-// Silence any piano notes that haven't played yet
+// A short, quiet metronome tick (pitched above the singing range so the pitch detector ignores it)
+function playClick(when, accent) {
+  const osc = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  const vol = METRONOME_VOLUME * (accent ? 1.4 : 1);       // first beat of each round is a bit louder
+  osc.type = 'sine';
+  osc.frequency.value = accent ? 2000 : 1500;
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.exponentialRampToValueAtTime(vol, when + 0.002);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + 0.05);
+  osc.connect(g);
+  g.connect(clickBus);
+  osc.start(when);
+  osc.stop(when + 0.06);
+}
+
+// How late (in ms) the phone's audio output is, if the browser will tell us
+function autoSyncMs() {
+  return ((audioCtx.outputLatency || 0) + (audioCtx.baseLatency || 0)) * 1000;
+}
+
+// Silence any piano notes and clicks that haven't played yet
 function endPiano() {
-  if (pianoBus) {
-    try {
-      pianoBus.gain.cancelScheduledValues(0);
-      pianoBus.gain.value = 0;
-      pianoBus.disconnect();
-    } catch (e) {}
-    pianoBus = null;
+  for (const bus of [pianoBus, clickBus]) {
+    if (bus) {
+      try {
+        bus.gain.cancelScheduledValues(0);
+        bus.gain.value = 0;
+        bus.disconnect();
+      } catch (e) {}
+    }
   }
+  pianoBus = null;
+  clickBus = null;
 }
 
 function beginWarmup() {
@@ -745,7 +788,13 @@ function beginWarmup() {
   const root = Number(rootSel.value);
   const rounds = Number(roundsSel.value);
   const beatMs = 60000 / Number(bpmSlider.value);
-  const t0 = performance.now() + LEAD_IN_SECONDS * 1000;   // when the first note starts
+  const leadMs = LEAD_IN_BEATS * beatMs;                       // length of the "3, 2, 1" count-in
+  const startDelay = 0.1;                                      // seconds; so nothing gets scheduled in the past
+  const syncMs = autoSyncMs() + Number(syncSlider.value);      // how late sound is heard after it's scheduled
+  // Times on the screen's clock. The bars are delayed by syncMs so they line up with what you HEAR.
+  const t0 = performance.now() + startDelay * 1000 + leadMs + syncMs;   // when the first note is heard
+  // The same moment on the audio clock (used to schedule the piano and clicks)
+  const audioT0 = audioCtx.currentTime + startDelay + leadMs / 1000;
 
   // Build the full list of target notes, with start/end times
   const notes = [];
@@ -767,6 +816,7 @@ function beginWarmup() {
   warmup = {
     notes: notes,
     rounds: rounds,
+    beatMs: beatMs,
     anyOctave: octaveChk.checked,
     endMs: notes[notes.length - 1].endMs + 600
   };
@@ -774,15 +824,35 @@ function beginWarmup() {
   history.length = 0;
   viewCenter = root + 5 + (rounds - 1) / 2;   // start with the notes in view
 
-  // Schedule every piano note on the audio clock so the timing is precise
+  // Schedule the sounds on the audio clock so the timing is precise
   if (pianoChk.checked) {
     pianoBus = audioCtx.createGain();
     pianoBus.gain.value = 1;
     pianoBus.connect(audioCtx.destination);
-    const audioT0 = audioCtx.currentTime + LEAD_IN_SECONDS - PIANO_LATENCY_SECONDS;
+    // reference note: the first note of the exercise is held during the count-in
+    playPianoNote(midiToFreq(notes[0].midi), audioT0 - leadMs / 1000, Math.max(0.3, leadMs / 1000 - 0.1));
     for (const n of notes) {
       const when = audioT0 + (n.startMs - t0) / 1000;
       playPianoNote(midiToFreq(n.midi), when, (n.endMs - n.startMs) / 1000);
+    }
+  }
+
+  if (metroChk.checked && METRONOME_VOLUME > 0) {
+    clickBus = audioCtx.createGain();
+    clickBus.gain.value = 1;
+    clickBus.connect(audioCtx.destination);
+    // clicks during the count-in
+    for (let k = 1; k <= LEAD_IN_BEATS; k++) {
+      playClick(audioT0 - (k * beatMs) / 1000, false);
+    }
+    // clicks through each round (louder on the first beat of a round)
+    for (let r = 0; r < rounds; r++) {
+      const roundNotes = notes.filter(n => n.round === r);
+      const roundStart = roundNotes[0].startMs;
+      const roundEnd = roundNotes[roundNotes.length - 1].endMs + (r < rounds - 1 ? REST_BEATS * beatMs : 0);
+      for (let b = 0; roundStart + b * beatMs < roundEnd - 1; b++) {
+        playClick(audioT0 + (roundStart + b * beatMs - t0) / 1000, b === 0);
+      }
     }
   }
 
@@ -895,6 +965,17 @@ gainSlider.addEventListener('input', () => {
 });
 
 bpmSlider.addEventListener('input', () => { bpmLabel.textContent = bpmSlider.value; });
+
+// Audio sync slider: remembered between visits. Raise it if the piano sounds LATE compared to the bars.
+try {
+  const savedSync = localStorage.getItem('singAppSyncMs');
+  if (savedSync !== null) syncSlider.value = savedSync;
+} catch (e) {}
+syncLabel.textContent = syncSlider.value + ' ms';
+syncSlider.addEventListener('input', () => {
+  syncLabel.textContent = syncSlider.value + ' ms';
+  try { localStorage.setItem('singAppSyncMs', syncSlider.value); } catch (e) {}
+});
 
 // Fill in the exercise and root-note drop-downs
 for (const key of Object.keys(EXERCISES)) {
