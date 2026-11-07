@@ -115,6 +115,12 @@
   .grid input[type=range] { width: 100%; }
   .checks { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-bottom: 8px; color: var(--muted); font-size: 0.85rem; }
   .checks label { display: flex; align-items: center; gap: 6px; }
+
+  /* Song settings */
+  .wide { grid-column: 1 / -1; }
+  .stepper { display: flex; gap: 6px; }
+  .stepper button { width: auto; flex: 1; padding: 5px 0; font-size: 1.1rem; background: #272c42; }
+  .hint { opacity: 0.7; }
 </style>
 </head>
 <body>
@@ -151,6 +157,7 @@
     <div class="tabs">
       <button id="modeFree" class="tab active">Free sing</button>
       <button id="modeWarmup" class="tab">Warmup</button>
+      <button id="modeSong" class="tab">Song</button>
     </div>
 
     <div id="warmupControls" hidden>
@@ -167,6 +174,21 @@
         </label>
         <label>Tempo: <span id="bpmLabel">80</span> BPM
           <input id="bpmSlider" type="range" min="50" max="140" step="5" value="80">
+        </label>
+      </div>
+    </div>
+
+    <div id="songControls" hidden>
+      <div class="grid">
+        <label class="wide">Song <select id="songSel"></select></label>
+        <label><span>Speed: <span id="speedLabel">100%</span></span>
+          <input id="speedSlider" type="range" min="50" max="120" step="5" value="100">
+        </label>
+        <label><span>Key: <span id="keyLabel">C major</span></span>
+          <div class="stepper"><button id="keyDown" aria-label="Key down">−</button><button id="keyUp" aria-label="Key up">+</button></div>
+        </label>
+        <label class="wide"><span>Vocal guide: <span id="melLabel">50%</span> <span class="hint">(0% = backing track only)</span></span>
+          <input id="melSlider" type="range" min="0" max="100" step="5" value="50">
         </label>
       </div>
     </div>
@@ -243,6 +265,12 @@ const TIGHT_CENTS       = 25;     // within this many cents of the target = full
 const LOOSE_CENTS       = 50;     // within this many cents = half points, further away = 0
 const METRONOME_VOLUME  = 0.2;    // metronome click loudness relative to the piano (0 = silent, 0.1 = quiet, 0.4 = loud)
 
+// --- Song mode settings ---
+const SONG_VIEW_SEMITONES  = 20;  // note lanes visible in song mode (fewer = taller note boxes)
+const SONG_VISIBLE_SECONDS = 6;   // seconds of song shown across the map in song mode
+const SONG_STRIP_H         = 28;  // height of the chord strip along the top of the map (px)
+const SONG_LYRICS_H        = 84;  // height of the lyrics area along the bottom of the map (px)
+
 const COLOURS = { good: '#3ddc97', ok: '#ffc857', bad: '#ff5d73', muted: '#8a92ab', line: '#6c8cff' };
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 const SHARP_PITCH_CLASSES = [1, 3, 6, 8, 10];   // C#, D#, F#, G#, A#
@@ -306,6 +334,17 @@ const resultsEl     = document.getElementById('results');
 const resPct        = document.getElementById('resPct');
 const resText       = document.getElementById('resText');
 const resClose      = document.getElementById('resClose');
+
+const modeSongBtn   = document.getElementById('modeSong');
+const songControls  = document.getElementById('songControls');
+const songSel       = document.getElementById('songSel');
+const speedSlider   = document.getElementById('speedSlider');
+const speedLabel    = document.getElementById('speedLabel');
+const keyLabel      = document.getElementById('keyLabel');
+const keyDownBtn    = document.getElementById('keyDown');
+const keyUpBtn      = document.getElementById('keyUp');
+const melSlider     = document.getElementById('melSlider');
+const melLabel      = document.getElementById('melLabel');
 
 /* =====================================================
    3. MUSIC MATHS
@@ -444,6 +483,15 @@ let mode = 'free';    // 'free' or 'warmup'
 let warmup = null;    // the running warmup (null when none is running)
 let pianoBus = null;  // volume control that all piano notes go through
 let clickBus = null;  // volume control for the metronome clicks
+let backBus = null;   // volume control for the song's backing track
+let songKeyShift = 0; // song mode: how many semitones the key is shifted (-6 to +6)
+let flatLabels = false;   // true while a song in a "flat" key (Bb, Eb...) is running, so the side labels say Bb not A#
+
+// Name for a note lane on the left of the map (follows flatLabels)
+function laneLabel(n) {
+  const names = flatLabels ? FLAT_NAMES : NOTE_NAMES;
+  return names[((n % 12) + 12) % 12] + (Math.floor(n / 12) - 1);
+}
 
 async function start() {
   try {
@@ -521,7 +569,9 @@ function loop() {
         ? 'Get ready…'
         : 'Get ready… ' + count + '  (reference note: ' + midiToName(warmup.notes[0].midi) + ')';
     } else if (target) {
-      statusEl.textContent = 'Round ' + (target.round + 1) + ' of ' + warmup.rounds + ' – sing ' + target.label + ' (' + midiToName(target.midi) + ')';
+      statusEl.textContent = warmup.song
+        ? '♪ ' + warmup.song.title + ' · ' + warmup.song.speedPct + '% · key ' + warmup.song.keyName
+        : 'Round ' + (target.round + 1) + ' of ' + warmup.rounds + ' – sing ' + target.label + ' (' + midiToName(target.midi) + ')';
     }
   }
 
@@ -545,7 +595,11 @@ function loop() {
   history.push({ t: now, midi: plotMidi });
 
   // --- warmup scoring ---
-  if (target && now >= target.startMs + GRACE_SECONDS * 1000) {
+  // (in songs the grace period is shortened for short notes, so quick notes still get scored)
+  const graceMs = (target && warmup.song)
+    ? Math.min(GRACE_SECONDS * 1000, (target.endMs - target.startMs) * 0.35)
+    : GRACE_SECONDS * 1000;
+  if (target && now >= target.startMs + graceMs) {
     target.total += dt;                                     // time we were "supposed" to be singing
     if (plotMidi !== null) {
       const diffCents = (plotMidi - target.midi) * 100;     // + = sharp, - = flat
@@ -626,7 +680,12 @@ function drawGraph(now) {
   lastDrawNow = now;
   const lowMidi  = viewCenter - viewSemitones / 2;
   const highMidi = viewCenter + viewSemitones / 2;
-  const yFor = m => h - ((m - lowMidi) / (highMidi - lowMidi)) * h;   // note number -> pixel row
+  // In song mode the note lanes sit between the chord strip (top) and the lyrics (bottom)
+  const song = warmup ? warmup.song : null;
+  const topPad = song ? SONG_STRIP_H : 0;
+  const bottomPad = song ? SONG_LYRICS_H : 0;
+  const laneAreaH = h - topPad - bottomPad;
+  const yFor = m => topPad + (1 - (m - lowMidi) / (highMidi - lowMidi)) * laneAreaH;   // note number -> pixel row
   const plotLeft = LABEL_WIDTH;
   const plotWidth = w - plotLeft;
 
@@ -676,18 +735,34 @@ function drawGraph(now) {
     ctx2d.fillStyle = n === activeNote ? '#ffffff' : (pitchClass === 0 ? '#c8cfee' : '#7e87a8');
     ctx2d.font = (pitchClass === 0 || n === activeNote ? 'bold ' : '') + '11px system-ui';
     ctx2d.textAlign = 'right';
-    ctx2d.fillText(midiToName(n), plotLeft - 8, yMid);
+    ctx2d.fillText(laneLabel(n), plotLeft - 8, yMid);
   }
 
-  // Everything below is clipped to the graph area so bars/lines don't spill over the note labels
+  // Song mode: backgrounds for the chord strip and lyrics (these also hide the lane edges)
+  if (song) {
+    ctx2d.fillStyle = '#151a2b';
+    ctx2d.fillRect(0, 0, w, topPad);
+    ctx2d.fillStyle = '#10131d';
+    ctx2d.fillRect(0, h - bottomPad, w, bottomPad);
+    ctx2d.strokeStyle = '#2a3048';
+    ctx2d.lineWidth = 1;
+    ctx2d.beginPath();
+    ctx2d.moveTo(0, topPad + 0.5);
+    ctx2d.lineTo(w, topPad + 0.5);
+    ctx2d.moveTo(0, h - bottomPad + 0.5);
+    ctx2d.lineTo(w, h - bottomPad + 0.5);
+    ctx2d.stroke();
+  }
+
+  // Everything below is clipped to the lane area so bars/lines don't spill over the note labels
   ctx2d.save();
   ctx2d.beginPath();
-  ctx2d.rect(plotLeft, 0, plotWidth, h);
+  ctx2d.rect(plotLeft, topPad, plotWidth, laneAreaH);
   ctx2d.clip();
 
   // --- warmup target notes: bars that scroll in from the right ---
   if (warmup) {
-    const laneH = h / viewSemitones;
+    const laneH = laneAreaH / viewSemitones;
     const barH = laneH * 0.78;
 
     for (const n of warmup.notes) {
@@ -731,11 +806,13 @@ function drawGraph(now) {
         ctx2d.textAlign = 'left';
         ctx2d.fillText(n.label, Math.max(x1, plotLeft) + 6, yc);
         // note name too (e.g. E4), if the box is long enough to hold both
-        if (boxW > labelW + 56) {
+        // (song notes set sub to '' because their label already IS the note name)
+        const rightText = (n.sub !== undefined) ? n.sub : midiToName(n.midi);
+        if (rightText && boxW > labelW + 56) {
           ctx2d.font = '11px system-ui';
           ctx2d.textAlign = 'right';
           ctx2d.fillStyle = 'rgba(13,16,32,0.7)';
-          ctx2d.fillText(midiToName(n.midi), x2 - 6, yc);
+          ctx2d.fillText(rightText, x2 - 6, yc);
         }
       }
     }
@@ -748,7 +825,7 @@ function drawGraph(now) {
         ctx2d.fillStyle = 'rgba(242,244,250,0.85)';
         ctx2d.font = 'bold 64px system-ui';
         ctx2d.textAlign = 'center';
-        ctx2d.fillText(String(count), plotLeft + plotWidth * 0.6, h / 2);
+        ctx2d.fillText(String(count), plotLeft + plotWidth * 0.6, topPad + laneAreaH / 2);
       }
     }
   }
@@ -792,6 +869,12 @@ function drawGraph(now) {
   }
 
   ctx2d.restore();
+
+  // Song mode: chords across the top, lyrics along the bottom
+  if (song) {
+    drawChordStrip(now, w, plotLeft, plotWidth, nowX, pxPerSec, topPad);
+    drawLyrics(now, w, h, bottomPad);
+  }
 }
 
 /* =====================================================
@@ -875,7 +958,7 @@ function getOutBus() {
 
 // Silence any piano notes and clicks that haven't played yet
 function endPiano() {
-  for (const bus of [pianoBus, clickBus, outBus]) {
+  for (const bus of [pianoBus, clickBus, backBus, outBus]) {
     if (bus) {
       try {
         bus.gain.cancelScheduledValues(0);
@@ -886,6 +969,7 @@ function endPiano() {
   }
   pianoBus = null;
   clickBus = null;
+  backBus = null;
   outBus = null;
 }
 
@@ -985,26 +1069,30 @@ function setPanelsCollapsed(collapsed) {
 }
 
 function cancelWarmup() {
+  const wasSong = warmup && warmup.song;
   warmup = null;
+  flatLabels = false;
   endPiano();
   stop();
   setModeButtonsEnabled(true);
   setPanelsCollapsed(false);
   viewSemitones = FREE_VIEW_SEMITONES;
   visibleSeconds = FREE_VISIBLE_SECONDS;
-  statusEl.textContent = 'Warmup stopped.';
+  statusEl.textContent = wasSong ? 'Song stopped.' : 'Warmup stopped.';
 }
 
 function finishWarmup() {
   const w = warmup;
   warmup = null;
+  flatLabels = false;
   endPiano();
   stop();
   setModeButtonsEnabled(true);
   setPanelsCollapsed(false);
   viewSemitones = FREE_VIEW_SEMITONES;
   visibleSeconds = FREE_VISIBLE_SECONDS;
-  statusEl.textContent = 'Warmup complete.';
+  statusEl.textContent = w.song ? 'Song complete.' : 'Warmup complete.';
+  document.getElementById('resTitle').textContent = w.song ? 'Song complete' : 'Warmup complete';
 
   // Add everything up
   let score = 0, total = 0, signed = 0, voiced = 0;
@@ -1041,6 +1129,365 @@ function finishWarmup() {
 }
 
 /* =====================================================
+   9b. SONG MODE
+   ===================================================== */
+// A song is a plain JS object. Later we'll load these from .json files made by a Python script,
+// so this is the "song file format". All times are in SECONDS, at 100% speed, in the key it was written in:
+//
+//   { id, title, bpm, beatsPerBar,
+//     keyTonic: 0..11 (0 = C, 1 = C#, ... 11 = B),  keyMode: 'major' or 'minor',
+//     duration,
+//     notes:  [{ t, d, midi }, ...]                      the melody (t = start time, d = length)
+//     chords: [{ t, d, name }, ...]                      e.g. 'Am', 'C', 'G7', 'F/A'
+//     lyrics: [{ t, text, words: [{ t, text }, ...] }]   one entry per line; "words" is optional }
+
+const FLAT_NAMES = ['C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
+
+function wrap12(n) { return ((Math.round(n) % 12) + 12) % 12; }
+
+// 'C' -> 0, 'F#' -> 6, 'Bb' -> 10
+function parsePc(name) {
+  let pc = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[name[0]];
+  if (name[1] === '#') pc += 1;
+  else if (name[1] === 'b') pc -= 1;
+  return wrap12(pc);
+}
+// 'C4' -> 60, 'A4' -> 69
+function noteNameToMidi(name) {
+  const m = /^([A-G][#b]?)(-?\d+)$/.exec(name);
+  return (Number(m[2]) + 1) * 12 + parsePc(m[1]);
+}
+
+// Should note names in this key use flats (Bb, Eb...) rather than sharps?
+function usesFlats(tonicPc, mode) {
+  const flatMajorKeys = [5, 10, 3, 8, 1, 6];   // F, Bb, Eb, Ab, Db, Gb
+  const flatMinorKeys = [2, 7, 0, 5, 10, 3];   // Dm, Gm, Cm, Fm, Bbm, Ebm
+  return (mode === 'minor' ? flatMinorKeys : flatMajorKeys).includes(tonicPc);
+}
+
+// Moves a chord name up/down by some semitones: transposeChord('Am7', 2, false) -> 'Bm7'
+function transposeChord(name, semis, preferFlats) {
+  const m = /^([A-G][#b]?)(.*?)(?:\/([A-G][#b]?))?$/.exec(name);
+  if (!m) return name;
+  const names = preferFlats ? FLAT_NAMES : NOTE_NAMES;
+  const move = n => names[wrap12(parsePc(n) + semis)];
+  return move(m[1]) + m[2] + (m[3] ? '/' + move(m[3]) : '');
+}
+
+// Works out which notes a chord name contains: { rootPc, tones: [semitones above the root] }
+function chordInfo(name) {
+  const m = /^([A-G][#b]?)(.*?)(?:\/.*)?$/.exec(name);
+  const suffix = m ? m[2] : '';
+  let third = 4, fifth = 7, extra = null;
+  if (/^(m(?!aj)|min|-)/.test(suffix)) third = 3;
+  if (/dim/.test(suffix)) { third = 3; fifth = 6; }
+  if (/aug|\+/.test(suffix)) fifth = 8;
+  if (/sus4/.test(suffix)) third = 5;
+  if (/sus2/.test(suffix)) third = 2;
+  if (/maj7|M7/.test(suffix)) extra = 11;
+  else if (/7/.test(suffix)) extra = 10;
+  const tones = [0, third, fifth];
+  if (extra !== null) tones.push(extra);
+  return { rootPc: m ? parsePc(m[1]) : 0, tones };
+}
+
+function keyNameFor(song, semis) {
+  const pc = wrap12(song.keyTonic + semis);
+  return (usesFlats(pc, song.keyMode) ? FLAT_NAMES : NOTE_NAMES)[pc] + ' ' + song.keyMode;
+}
+
+// ---- The built-in test tune: "Twinkle, Twinkle, Little Star" (public domain) ----
+function buildTwinkle() {
+  const bpm = 100;
+  const beat = 60 / bpm;                                  // seconds per beat
+
+  // The melody: [note, beats, syllable]. A syllable ending in "-" joins on to the next one (same word).
+  const verse = [
+    ['C4',1,'Twin-'],['C4',1,'kle,'],['G4',1,'twin-'],['G4',1,'kle,'],['A4',1,'lit-'],['A4',1,'tle'],['G4',2,'star,'],
+    ['F4',1,'How'],['F4',1,'I'],['E4',1,'won-'],['E4',1,'der'],['D4',1,'what'],['D4',1,'you'],['C4',2,'are!'],
+    ['G4',1,'Up'],['G4',1,'a-'],['F4',1,'bove'],['F4',1,'the'],['E4',1,'world'],['E4',1,'so'],['D4',2,'high,'],
+    ['G4',1,'Like'],['G4',1,'a'],['F4',1,'dia-'],['F4',1,'mond'],['E4',1,'in'],['E4',1,'the'],['D4',2,'sky.']
+  ];
+  const tune = verse.concat(verse.slice(0, 14));          // then the first two lines again
+
+  const notes = [];
+  let cursor = 0;                                         // position in beats
+  for (const [name, beats, syl] of tune) {
+    notes.push({ t: cursor * beat, d: beats * beat, midi: noteNameToMidi(name), syl: syl });
+    cursor += beats;
+  }
+
+  // Lyrics: every line is 7 notes. Each word starts when its first syllable starts.
+  const lyrics = [];
+  for (let i = 0; i < notes.length; i += 7) {
+    const group = notes.slice(i, i + 7);
+    const words = [];
+    let cur = null;
+    for (const n of group) {
+      if (!cur) cur = { t: n.t, text: '' };
+      cur.text += n.syl.replace(/-$/, '');
+      if (!n.syl.endsWith('-')) { words.push(cur); cur = null; }
+    }
+    lyrics.push({ t: group[0].t, text: words.map(wd => wd.text).join(' '), words: words });
+  }
+
+  // Chords: one chord per half-bar (2 beats); neighbours that match get merged into one long chord
+  const halfBars = ['C','C','F','C','F','C','G','C','C','F','C','G','C','F','C','G','C','C','F','C','F','C','G','C'];
+  const chords = [];
+  halfBars.forEach((name, i) => {
+    const last = chords[chords.length - 1];
+    if (last && last.name === name) last.d += 2 * beat;
+    else chords.push({ t: i * 2 * beat, d: 2 * beat, name: name });
+  });
+
+  return {
+    id: 'twinkle', title: 'Twinkle, Twinkle, Little Star (test tune)',
+    bpm: bpm, beatsPerBar: 4, keyTonic: 0, keyMode: 'major',
+    duration: cursor * beat, notes: notes, chords: chords, lyrics: lyrics
+  };
+}
+
+const SONGS = { twinkle: buildTwinkle() };
+
+// ---- Synthesised backing track (until we load real audio): bass + a gently plucked chord pattern ----
+function playPluck(freq, when, dur, vol, type) {
+  const osc = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.exponentialRampToValueAtTime(vol, when + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+  osc.connect(g);
+  g.connect(backBus);
+  osc.start(when);
+  osc.stop(when + dur + 0.05);
+}
+
+function scheduleBacking(song, chords, speed, audioT0) {
+  const beatSec = 60 / song.bpm;                          // one beat at 100% speed
+  const pattern = [0, 2, 1, 2];                           // which chord tone gets plucked on each beat
+  for (const c of chords) {
+    const info = chordInfo(c.name);
+    const base = 48 + info.rootPc;                        // the chord root, in the octave starting at C3
+    const beats = Math.max(1, Math.round(c.d / beatSec));
+    for (let k = 0; k < beats; k++) {
+      const when = audioT0 + (c.t + k * beatSec) / speed;
+      const tone = info.tones[pattern[k % 4] % info.tones.length];
+      playPluck(midiToFreq(base + 12 + tone), when, (beatSec / speed) * 1.6, 0.22, 'triangle');
+      if (k % 2 === 0) playPluck(midiToFreq(base - 12), when, (beatSec / speed) * 1.8, 0.4, 'triangle');   // bass
+    }
+  }
+}
+
+function beginSong() {
+  const song = SONGS[songSel.value];
+  const speed = Number(speedSlider.value) / 100;          // 1 = full speed, 0.8 = 80%...
+  const semis = songKeyShift;
+  const melVol = Number(melSlider.value) / 100;           // vocal guide volume: 0 = backing track only
+  const flats = usesFlats(wrap12(song.keyTonic + semis), song.keyMode);
+  const noteNames = flats ? FLAT_NAMES : NOTE_NAMES;
+  flatLabels = flats;
+
+  const beatMs = 60000 / (song.bpm * speed);              // one beat, on the screen's clock
+  const leadMs = LEAD_IN_BEATS * beatMs;                  // the "3, 2, 1" count-in
+  const startDelay = 0.1;
+  const syncMs = autoSyncMs() + Number(syncSlider.value);
+  const t0 = performance.now() + startDelay * 1000 + leadMs + syncMs;   // when song time 0 is heard
+  const audioT0 = audioCtx.currentTime + startDelay + leadMs / 1000;    // the same moment on the audio clock
+  const toMs = sec => t0 + (sec / speed) * 1000;          // song seconds -> screen clock
+
+  const notes = song.notes.map(n => ({
+    midi: n.midi + semis,
+    label: noteNames[wrap12(n.midi + semis)],             // the note letter shown inside the box
+    sub: '',
+    startMs: toMs(n.t), endMs: toMs(n.t + n.d),
+    round: 0, score: 0, total: 0, signed: 0, voiced: 0
+  }));
+  const chords = song.chords.map(c => ({
+    name: transposeChord(c.name, semis, flats),
+    t: c.t, d: c.d,
+    startMs: toMs(c.t), endMs: toMs(c.t + c.d)
+  }));
+  const lyrics = song.lyrics.map(l => ({
+    text: l.text,
+    startMs: toMs(l.t),
+    words: (l.words || []).map(wd => ({ text: wd.text, startMs: toMs(wd.t) }))
+  }));
+
+  const lastMs = Math.max(notes[notes.length - 1].endMs, chords.length ? chords[chords.length - 1].endMs : 0);
+  warmup = {
+    notes: notes,
+    rests: [],
+    rounds: 1,
+    beatMs: beatMs,
+    anyOctave: octaveChk.checked,
+    song: {
+      title: song.title, chords: chords, lyrics: lyrics,
+      speedPct: Math.round(speed * 100), keyName: keyNameFor(song, semis)
+    },
+    endMs: lastMs + 600
+  };
+
+  history.length = 0;
+  viewSemitones = SONG_VIEW_SEMITONES;
+  visibleSeconds = SONG_VISIBLE_SECONDS;
+  const lowNote = Math.min(...notes.map(n => n.midi)), highNote = Math.max(...notes.map(n => n.midi));
+  viewCenter = (lowNote + highNote) / 2;
+
+  // --- sounds, all scheduled on the audio clock ---
+  backBus = audioCtx.createGain();
+  backBus.gain.value = 1;
+  backBus.connect(getOutBus());
+  scheduleBacking(song, chords, speed, audioT0);
+
+  if (melVol > 0) {
+    pianoBus = audioCtx.createGain();
+    pianoBus.gain.value = melVol;
+    pianoBus.connect(getOutBus());
+    // reference note during the count-in: the first note of the melody
+    playPianoNote(midiToFreq(notes[0].midi), audioT0 - leadMs / 1000, Math.max(0.3, leadMs / 1000 - 0.1));
+    for (const n of notes) {
+      const when = audioT0 + (n.startMs - t0) / 1000;
+      playPianoNote(midiToFreq(n.midi), when, (n.endMs - n.startMs) / 1000);
+    }
+  }
+
+  if (metroChk.checked && METRONOME_VOLUME > 0) {
+    clickBus = audioCtx.createGain();
+    clickBus.gain.value = 1;
+    clickBus.connect(getOutBus());
+    for (let k = 1; k <= LEAD_IN_BEATS; k++) playClick(audioT0 - (k * beatMs) / 1000, false);
+    const totalBeats = Math.round(song.duration / (60 / song.bpm));
+    for (let b = 0; b < totalBeats; b++) {
+      playClick(audioT0 + (b * beatMs) / 1000, b % song.beatsPerBar === 0);
+    }
+  }
+
+  setModeButtonsEnabled(false);
+  setPanelsCollapsed(true);
+  refreshButton();
+}
+
+// ---- Chord strip: |--- Am ---|--- C ---| scrolling along the top of the map ----
+function drawChordStrip(now, w, plotLeft, plotWidth, nowX, pxPerSec, stripH) {
+  const yMid = stripH / 2;
+  ctx2d.textBaseline = 'middle';
+  ctx2d.textAlign = 'right';
+  ctx2d.fillStyle = '#5b6482';
+  ctx2d.font = '10px system-ui';
+  ctx2d.fillText('chords', plotLeft - 8, yMid);
+
+  ctx2d.save();
+  ctx2d.beginPath();
+  ctx2d.rect(plotLeft, 0, plotWidth, stripH);
+  ctx2d.clip();
+  ctx2d.textAlign = 'center';
+  for (const c of warmup.song.chords) {
+    const x1 = nowX + ((c.startMs - now) / 1000) * pxPerSec;
+    const x2 = nowX + ((c.endMs - now) / 1000) * pxPerSec;
+    if (x2 < plotLeft || x1 > w) continue;
+    const isCurrent = now >= c.startMs && now < c.endMs;
+
+    if (isCurrent) {
+      ctx2d.fillStyle = 'rgba(108,140,255,0.22)';
+      ctx2d.fillRect(x1, 2, x2 - x1, stripH - 4);
+    }
+    // the "|" at the start of each chord
+    ctx2d.strokeStyle = 'rgba(138,146,171,0.7)';
+    ctx2d.lineWidth = 1.5;
+    ctx2d.beginPath();
+    ctx2d.moveTo(x1, 5);
+    ctx2d.lineTo(x1, stripH - 5);
+    ctx2d.stroke();
+
+    // the label stays visible while the chord slides under the left edge
+    const vx1 = Math.max(x1, plotLeft), vx2 = Math.min(x2, w);
+    if (vx2 - vx1 < 22) continue;
+    const cx = (vx1 + vx2) / 2;
+    ctx2d.font = 'bold 14px system-ui';
+    const tw = ctx2d.measureText(c.name).width;
+
+    // the "---" either side of the label
+    ctx2d.strokeStyle = 'rgba(138,146,171,0.35)';
+    ctx2d.lineWidth = 1;
+    ctx2d.beginPath();
+    if (cx - tw / 2 - 6 > vx1 + 6) { ctx2d.moveTo(vx1 + 6, yMid); ctx2d.lineTo(cx - tw / 2 - 6, yMid); }
+    if (cx + tw / 2 + 6 < vx2 - 6) { ctx2d.moveTo(cx + tw / 2 + 6, yMid); ctx2d.lineTo(vx2 - 6, yMid); }
+    ctx2d.stroke();
+
+    ctx2d.fillStyle = isCurrent ? '#ffffff' : '#c8cfee';
+    ctx2d.fillText(c.name, cx, yMid);
+  }
+  // the "now" line carries on through the strip
+  ctx2d.strokeStyle = 'rgba(242,244,250,0.55)';
+  ctx2d.lineWidth = 2;
+  ctx2d.beginPath();
+  ctx2d.moveTo(nowX, 0);
+  ctx2d.lineTo(nowX, stripH);
+  ctx2d.stroke();
+  ctx2d.restore();
+}
+
+// ---- Lyrics: the current line is big and in the middle, with the lines before/after it faded.
+// ---- Words turn blue as you reach them, and the lines slide up when a new one starts.
+function drawLyrics(now, w, h, areaH) {
+  const lines = warmup.song.lyrics;
+  if (!lines.length) return;
+  const areaTop = h - areaH;
+
+  ctx2d.save();
+  ctx2d.beginPath();
+  ctx2d.rect(0, areaTop, w, areaH);
+  ctx2d.clip();
+  ctx2d.textBaseline = 'middle';
+  ctx2d.textAlign = 'left';
+
+  // which line is current, and how far through the slide to the next line are we?
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startMs <= now) idx = i; else break;
+  }
+  let pos = -1;                                            // "-1" = nothing has started yet
+  if (idx >= 0) {
+    const t = Math.min(1, Math.max(0, (now - lines[idx].startMs) / 350));   // the slide takes 350 ms
+    pos = idx - 1 + t * t * (3 - 2 * t);
+  }
+
+  const lineH = 27;
+  const centerY = areaTop + areaH / 2;
+  const availW = w - 28;
+  for (let k = Math.max(0, Math.floor(pos) - 1); k <= Math.min(lines.length - 1, Math.ceil(pos) + 2); k++) {
+    const d = k - pos;                                     // 0 = in the middle, -1 = one line above...
+    const y = centerY + d * lineH;
+    if (y < areaTop - lineH || y > h + lineH) continue;
+    const closeness = Math.max(0, 1 - Math.abs(d));
+    drawLyricLine(lines[k], w / 2, y, 14 + 4 * closeness, 0.32 + 0.68 * closeness, k === idx, now, availW);
+  }
+  ctx2d.restore();
+}
+
+function drawLyricLine(line, cx, y, fs, alpha, isCurrent, now, availW) {
+  const words = (line.words && line.words.length) ? line.words : [{ text: line.text, startMs: Infinity }];
+  let total = 0, space = 0;
+  for (;;) {                                               // shrink the text until the whole line fits
+    ctx2d.font = (isCurrent ? 'bold ' : '') + fs + 'px system-ui';
+    space = ctx2d.measureText(' ').width;
+    total = space * (words.length - 1);
+    for (const wd of words) total += ctx2d.measureText(wd.text).width;
+    if (total <= availW || fs <= 9) break;
+    fs -= 1;
+  }
+  let x = cx - total / 2;
+  for (const wd of words) {
+    const sung = isCurrent && now >= wd.startMs;
+    ctx2d.fillStyle = sung ? '#9db4ff' : 'rgba(242,244,250,' + (isCurrent ? 0.85 : alpha) + ')';
+    ctx2d.fillText(wd.text, x, y);
+    x += ctx2d.measureText(wd.text).width + space;
+  }
+}
+
+/* =====================================================
    10. MODE SWITCHING, BUTTONS & SLIDERS
    ===================================================== */
 // Sets the main button's label and colour to match what it will do
@@ -1049,7 +1496,8 @@ function refreshButton() {
     btn.textContent = running ? 'Stop' : 'Start';
     btn.classList.toggle('stop', running);
   } else {
-    btn.textContent = warmup ? 'Stop warmup' : 'Start warmup';
+    const what = mode === 'song' ? 'song' : 'warmup';
+    btn.textContent = (warmup ? 'Stop ' : 'Start ') + what;
     btn.classList.toggle('stop', !!warmup);
   }
 }
@@ -1057,18 +1505,24 @@ function refreshButton() {
 function setModeButtonsEnabled(enabled) {
   modeFreeBtn.disabled = !enabled;
   modeWarmupBtn.disabled = !enabled;
+  modeSongBtn.disabled = !enabled;
 }
 
 function setMode(newMode) {
   mode = newMode;
   modeFreeBtn.classList.toggle('active', mode === 'free');
   modeWarmupBtn.classList.toggle('active', mode === 'warmup');
+  modeSongBtn.classList.toggle('active', mode === 'song');
   warmupControls.hidden = (mode !== 'warmup');
-  document.getElementById('moreWarmup').hidden = (mode !== 'warmup');   // guide sounds/sync only matter in warmups
+  songControls.hidden = (mode !== 'song');
+  document.getElementById('moreWarmup').hidden = (mode === 'free');     // guide sounds/sync matter in warmups and songs
+  pianoChk.parentElement.hidden = (mode === 'song');                    // songs use the "Vocal guide" slider instead
   resultsEl.hidden = true;
   refreshButton();
   statusEl.textContent = mode === 'warmup'
     ? 'Use wired headphones if the piano is on, or the mic will hear it.'
+    : mode === 'song'
+    ? 'Use wired headphones, or the mic will pick up the backing track.'
     : 'Tip: use headphones later when playing backing tracks.';
 }
 
@@ -1082,18 +1536,19 @@ moreBtn.addEventListener('click', () => {
 
 modeFreeBtn.addEventListener('click', () => setMode('free'));
 modeWarmupBtn.addEventListener('click', () => setMode('warmup'));
+modeSongBtn.addEventListener('click', () => setMode('song'));
 
 btn.addEventListener('click', async () => {
   if (mode === 'free') {
     running ? stop() : start();
     return;
   }
-  // Warmup mode
+  // Warmup or song mode
   if (warmup) { cancelWarmup(); return; }
   resultsEl.hidden = true;
-  if (!running) await start();     // the warmup needs the mic on
+  if (!running) await start();     // the warmup / song needs the mic on
   if (!running) return;            // mic was blocked
-  beginWarmup();
+  if (mode === 'song') beginSong(); else beginWarmup();
 });
 
 resClose.addEventListener('click', () => { resultsEl.hidden = true; });
@@ -1148,6 +1603,27 @@ for (let m = 48; m <= 72; m++) {            // C3 up to C5
   if (m === 60) o.selected = true;           // default root: C4
   rootSel.appendChild(o);
 }
+
+// Song mode: fill in the song list and wire up the speed / key / vocal guide controls
+for (const id of Object.keys(SONGS)) {
+  const o = document.createElement('option');
+  o.value = id;
+  o.textContent = SONGS[id].title;
+  songSel.appendChild(o);
+}
+function updateSongLabels() {
+  const song = SONGS[songSel.value];
+  speedLabel.textContent = speedSlider.value + '%';
+  melLabel.textContent = melSlider.value + '%';
+  keyLabel.textContent = keyNameFor(song, songKeyShift) +
+    (songKeyShift ? ' (' + (songKeyShift > 0 ? '+' : '') + songKeyShift + ')' : '');
+}
+speedSlider.addEventListener('input', updateSongLabels);
+melSlider.addEventListener('input', updateSongLabels);
+keyUpBtn.addEventListener('click', () => { songKeyShift = Math.min(6, songKeyShift + 1); updateSongLabels(); });
+keyDownBtn.addEventListener('click', () => { songKeyShift = Math.max(-6, songKeyShift - 1); updateSongLabels(); });
+songSel.addEventListener('change', () => { songKeyShift = 0; updateSongLabels(); });
+updateSongLabels();
 
 // Draw the empty graph straight away so the layout is visible before pressing Start
 drawGraph(performance.now());
